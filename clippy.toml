@@ -1,0 +1,45 @@
+allow-renamed-params-for = [
+  "..",
+  "core::fmt::Debug",
+  "core::fmt::Display",
+]
+
+missing-docs-in-crate-items = false
+
+# ".." keeps clippy's defaults (foo, baz, quux). The rest enforce precise
+# domain nouns, no generic names, and no nonstandard abbreviations.
+disallowed-names = [
+  "..",
+  "data",
+  "item",
+  "items",
+  "manager",
+  "mgr",
+  "info",
+  "helper",
+  "util",
+  "tmp",
+  "temp",
+  "obj",
+  "thing",
+  "res",
+  "src",
+  "dst",
+  "dest",
+]
+
+disallowed-methods = [
+  { path = "tokio::sync::mpsc::unbounded_channel", allow-invalid = true, reason = "every queue has a bound; use tokio::sync::mpsc::channel" },
+  { path = "std::sync::mpsc::channel", reason = "every queue has a bound; use std::sync::mpsc::sync_channel" },
+]
+
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "iteration order varies between runs; use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order varies between runs; use BTreeSet" },
+]
+
+disallowed-macros = [
+  { path = "core::debug_assert", reason = "assertions run in every build; demote only with a measured cost reason via #[expect]" },
+  { path = "core::debug_assert_eq", reason = "assertions run in every build; demote only with a measured cost reason via #[expect]" },
+  { path = "core::debug_assert_ne", reason = "assertions run in every build; demote only with a measured cost reason via #[expect]" },
+]
