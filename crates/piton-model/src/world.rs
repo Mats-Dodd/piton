@@ -56,6 +56,25 @@ impl WorldConfig {
         }
     }
 
+    /// For replaying journals from real shells: the session's tools and
+    /// model policy, and nothing for the generator to do.
+    #[must_use]
+    pub const fn replaying(tools: Vec<ToolSpec>, model: ModelPolicy) -> Self {
+        Self {
+            tools,
+            model,
+            tool_replies: Vec::new(),
+            invalid_replies: false,
+            tool_rounds: 0,
+            model_failures: 0,
+            submits: 0,
+            cancels: 0,
+            crashes: 0,
+            late_completions: false,
+            late_appends: false,
+        }
+    }
+
     /// Larger budgets for random walks, which go deep rather than wide.
     #[must_use]
     pub fn deep() -> Self {

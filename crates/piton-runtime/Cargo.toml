@@ -1,0 +1,20 @@
+[package]
+name = "piton-runtime"
+description = "Runs piton sessions on tokio: the embeddable host that executes the core's work against pluggable storage, models and tools."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+piton-core.workspace = true
+piton-domain.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+piton-model.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true
