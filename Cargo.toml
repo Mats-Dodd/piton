@@ -18,10 +18,14 @@ piton-runtime = { path = "crates/piton-runtime", version = "0.1.0" }
 
 async-trait = { version = "0.1.92", default-features = false }
 
+# Simulation only: replaces the process's clock and entropy sources.
+mad-turmoil = { version = "0.2.1", default-features = false }
 proptest = { version = "1.12.0", default-features = false }
+rand = { version = "0.10.0", default-features = false }
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.154", default-features = false }
 tokio = { version = "1.53.0", default-features = false }
+turmoil = { version = "0.7.2", default-features = false }
 # Pinned exactly: thinly maintained, and model-checking results should not
 # shift under a dependency bump. Its own dependencies are not feature-gated.
 stateright = { version = "=0.31.0", default-features = false }
@@ -64,7 +68,11 @@ unused_macro_rules = "warn"
 unused_qualifications = "warn"
 # `piton_planted_bug` deliberately breaks the core so `just planted-bug` can
 # prove the checkers catch it.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(piton_planted_bug)"] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(piton_planted_bug)",
+    "cfg(piton_planted_shell_bug)",
+    "cfg(tokio_unstable)",
+] }
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

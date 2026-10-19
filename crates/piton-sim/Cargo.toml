@@ -1,0 +1,22 @@
+[package]
+name = "piton-sim"
+description = "Deterministic simulation of piton-runtime under faults, checked against the model harness."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+mad-turmoil.workspace = true
+piton-core.workspace = true
+piton-domain.workspace = true
+piton-model.workspace = true
+piton-runtime.workspace = true
+rand = { workspace = true, features = ["std_rng"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+turmoil.workspace = true
+
+[lints]
+workspace = true

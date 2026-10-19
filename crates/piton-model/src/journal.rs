@@ -4,8 +4,8 @@ use piton_core::{Input, JournalEntry, Submission};
 use piton_domain::{Offset, Timestamp};
 
 use crate::{
-    EnvAction, Violation, World, WorldConfig, admits, check, check_exploration, enabled, recovery,
-    step,
+    EnvAction, Violation, World, WorldConfig, admits, check, check_exploration, enabled,
+    recoveries, step,
 };
 
 /// Where a journal and the harness disagree.
@@ -43,6 +43,11 @@ pub enum DivergenceReason {
 /// Journals from any source replay alike: model walks, the simulator, or a
 /// production shell. `config` supplies the session's tools and model policy.
 ///
+/// A journal does not show everything storage did: when a session restarts
+/// it records only the log's length, which more than one history can
+/// explain. Replay keeps every world still consistent with the journal and
+/// fails only when none is.
+///
 /// # Errors
 ///
 /// Returns the first entry where the journal and the harness disagree.
@@ -56,7 +61,7 @@ pub fn validate(config: &WorldConfig, entries: &[JournalEntry]) -> Result<World,
     else {
         return Err(diverged(0, DivergenceReason::NotFromCreation));
     };
-    let (mut world, start) = World::start(config, *now);
+    let (world, start) = World::start(config, *now);
     let JournalEntry::Recovered {
         log_len: created_len,
         submissions: replayed,
@@ -71,15 +76,36 @@ pub fn validate(config: &WorldConfig, entries: &[JournalEntry]) -> Result<World,
     compare(submissions, replayed).map_err(|reason| diverged(0, reason))?;
     check(&world).map_err(|violation| diverged(0, DivergenceReason::Invariant(violation)))?;
 
+    let mut frontier = Vec::from([world]);
     for (index, entry) in entries.iter().enumerate().skip(1) {
-        replay(&mut world, entry).map_err(|reason| diverged(index, reason))?;
-        check(&world)
-            .map_err(|violation| diverged(index, DivergenceReason::Invariant(violation)))?;
+        let mut next: Vec<World> = Vec::new();
+        let mut first_failure = None;
+        for world in &frontier {
+            for candidate in replay(world, entry) {
+                match candidate.and_then(|world| {
+                    check(&world).map_err(DivergenceReason::Invariant)?;
+                    Ok(world)
+                }) {
+                    Ok(world) if !next.contains(&world) => next.push(world),
+                    Ok(_) => {}
+                    Err(reason) => {
+                        first_failure.get_or_insert(reason);
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            let reason = first_failure.unwrap_or(DivergenceReason::Inadmissible);
+            return Err(diverged(index, reason));
+        }
+        frontier = next;
     }
-    Ok(world)
+    Ok(frontier.swap_remove(0))
 }
 
-fn replay(world: &mut World, entry: &JournalEntry) -> Result<(), DivergenceReason> {
+/// The worlds `entry` can lead to from `world`, or why it cannot.
+fn replay(world: &World, entry: &JournalEntry) -> Vec<Result<World, DivergenceReason>> {
+    let mut world = world.clone();
     match entry {
         JournalEntry::Handled {
             now,
@@ -97,10 +123,11 @@ fn replay(world: &mut World, entry: &JournalEntry) -> Result<(), DivergenceReaso
                 | Input::Submit { .. }
                 | Input::CancelTurn { .. } => EnvAction::Deliver(input.clone()),
             };
-            if !admits(world, &action) {
-                return Err(DivergenceReason::Inadmissible);
+            if !admits(&world, &action) {
+                return Vec::from([Err(DivergenceReason::Inadmissible)]);
             }
-            compare(submissions, replayed(step(world, action)))
+            let replayed = replayed(step(&mut world, action));
+            Vec::from([compare(submissions, replayed).map(|()| world)])
         }
         JournalEntry::Recovered {
             now,
@@ -108,13 +135,23 @@ fn replay(world: &mut World, entry: &JournalEntry) -> Result<(), DivergenceReaso
             submissions,
         } => {
             world.advance_to(*now);
-            let actions = recovery(world, *log_len)
-                .ok_or(DivergenceReason::UnexplainedRecovery { log_len: *log_len })?;
-            let mut last = None;
-            for action in actions {
-                last = step(world, action);
+            let explanations = recoveries(&world, *log_len);
+            if explanations.is_empty() {
+                return Vec::from([Err(DivergenceReason::UnexplainedRecovery {
+                    log_len: *log_len,
+                })]);
             }
-            compare(submissions, replayed(last))
+            explanations
+                .into_iter()
+                .map(|actions| {
+                    let mut candidate = world.clone();
+                    let mut last = None;
+                    for action in actions {
+                        last = step(&mut candidate, action);
+                    }
+                    compare(submissions, replayed(last)).map(|()| candidate)
+                })
+                .collect()
         }
     }
 }

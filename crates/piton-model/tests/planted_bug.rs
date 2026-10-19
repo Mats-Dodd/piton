@@ -36,8 +36,11 @@ fn stateright_finds_the_planted_bug() {
             check(&world).err().map(|violation| (index, violation))
         });
     assert!(
-        matches!(first_break, Some((0, Violation::DispatchBeforeDurable(_)))),
-        "the first submission dispatches early, got {first_break:?}"
+        matches!(
+            first_break,
+            Some((0..=2, Violation::DispatchBeforeDurable(_)))
+        ),
+        "an effect is dispatched early within a couple of steps, got {first_break:?}"
     );
 }
 

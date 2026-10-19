@@ -175,6 +175,19 @@ impl Pump {
                 let id = self.id.clone();
                 let end = end_of(expected, &records);
                 self.append = Some(tokio::spawn(async move {
+                    if cfg!(piton_planted_shell_bug) {
+                        // Planted bug: acknowledge before storage answers.
+                        let input = Input::Appended { end };
+                        sender
+                            .send(Event::Completed { life, input })
+                            .await
+                            .unwrap_or_default();
+                        store
+                            .append(&id, expected, records)
+                            .await
+                            .unwrap_or_default();
+                        return;
+                    }
                     let event = match store.append(&id, expected, records).await {
                         Ok(()) => Event::Completed {
                             life,

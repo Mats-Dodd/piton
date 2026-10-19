@@ -155,9 +155,9 @@ pub enum EnvAction {
     /// does the same when an append fails, since it cannot tell whether the
     /// append landed.
     Crash { append_lands: bool },
-    /// An append the shell gave up on reaches storage after all, unseen by
-    /// the session.
-    LateAppendLands,
+    /// An append the shell gave up on (the `n`th still pending) reaches
+    /// storage after all, unseen by the session.
+    LateAppendLands(usize),
 }
 
 /// An append storage has not answered.
@@ -177,8 +177,9 @@ pub struct Env {
     /// The log length the session last learned is durable.
     acknowledged: Offset,
     in_flight: Option<Pending>,
-    /// An append from an earlier life that may still land.
-    late: Option<Pending>,
+    /// Appends from earlier lives that may still land. All expect the
+    /// current tail; once it moves, none of them can.
+    late: Vec<Pending>,
     late_landed: bool,
     dispatched: BTreeMap<EffectId, Effect>,
     cancel_requested: BTreeSet<EffectId>,
@@ -234,7 +235,7 @@ impl World {
             acknowledged: log_len(&durable),
             durable,
             in_flight: None,
-            late: None,
+            late: Vec::new(),
             late_landed: false,
             dispatched: BTreeMap::new(),
             cancel_requested: BTreeSet::new(),
@@ -333,6 +334,14 @@ impl Env {
         self.durable.iter().any(|record| {
             matches!(&record.body, RecordBody::InputAdmitted { request_id: admitted, .. } if admitted == request_id)
         })
+    }
+
+    /// Storage takes `records` at its tail. Appends still waiting to land
+    /// expected the old tail, so none of them can land any more.
+    fn land(&mut self, records: Vec<Record>) {
+        self.durable.extend(records);
+        let tail = self.tail();
+        self.late.retain(|late| late.expected == tail);
     }
 
     fn tail(&self) -> Offset {
@@ -522,13 +531,12 @@ pub fn enabled(config: &WorldConfig, world: &World) -> Vec<EnvAction> {
             append_lands: false,
         });
     }
-    if config.late_appends
-        && env
-            .late
-            .as_ref()
-            .is_some_and(|late| late.expected == env.tail())
-    {
-        actions.push(EnvAction::LateAppendLands);
+    if config.late_appends {
+        for (index, late) in env.late.iter().enumerate() {
+            if late.expected == env.tail() {
+                actions.push(EnvAction::LateAppendLands(index));
+            }
+        }
     }
     if let Some(at) = world.session.deadline() {
         actions.push(EnvAction::Tick { at });
@@ -567,9 +575,9 @@ pub fn admits(world: &World, action: &EnvAction) -> bool {
             append_lands: false,
         } => true,
         EnvAction::Crash { append_lands: true } => env.append_can_land(),
-        EnvAction::LateAppendLands => env
+        EnvAction::LateAppendLands(index) => env
             .late
-            .as_ref()
+            .get(*index)
             .is_some_and(|late| late.expected == env.tail()),
     }
 }
@@ -584,7 +592,7 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
             match &input {
                 Input::Appended { .. } => {
                     if let Some(pending) = env.in_flight.take() {
-                        env.durable.extend(pending.records);
+                        env.land(pending.records);
                     }
                     env.acknowledged = env.tail();
                 }
@@ -619,11 +627,13 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
         }
         EnvAction::Crash { append_lands } => {
             env.crashes = env.crashes.saturating_add(1);
-            if let Some(pending) = env.in_flight.take() {
-                if append_lands && pending.expected == env.tail() {
-                    env.durable.extend(pending.records);
-                } else if pending.expected == env.tail() {
-                    env.late = Some(pending);
+            if let Some(pending) = env.in_flight.take()
+                && pending.expected == env.tail()
+            {
+                if append_lands {
+                    env.land(pending.records);
+                } else {
+                    env.late.push(pending);
                 }
             }
             env.dispatched.clear();
@@ -644,12 +654,13 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
                 submissions,
             });
         }
-        EnvAction::LateAppendLands => {
-            if let Some(late) = env.late.take()
-                && late.expected == env.tail()
-            {
-                env.durable.extend(late.records);
-                env.late_landed = true;
+        EnvAction::LateAppendLands(index) => {
+            if index < env.late.len() {
+                let late = env.late.swap_remove(index);
+                if late.expected == env.tail() {
+                    env.land(late.records);
+                    env.late_landed = true;
+                }
             }
             return None;
         }
@@ -663,11 +674,12 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
     })
 }
 
-/// The actions that explain a session restarting from a log of `log_len`
-/// records: the outstanding append landed, a late append landed first, or
-/// nothing landed.
+/// Every sequence of actions that explains a restart from `log_len` records.
+///
+/// The outstanding append landed, a late append landed first, or nothing
+/// landed. More than one can fit, since a journal records only the length.
 #[must_use]
-pub fn recovery(world: &World, log_len: Offset) -> Option<Vec<EnvAction>> {
+pub fn recoveries(world: &World, log_len: Offset) -> Vec<Vec<EnvAction>> {
     let env = &world.env;
     let tail = env.tail();
     let lands = |pending: &Pending| {
@@ -677,22 +689,26 @@ pub fn recovery(world: &World, log_len: Offset) -> Option<Vec<EnvAction>> {
                 .and_then(|added| tail.get().checked_add(added))
                 == Some(log_len.get())
     };
+    let mut explanations = Vec::new();
     if env.in_flight.as_ref().is_some_and(lands) {
-        Some(Vec::from([EnvAction::Crash { append_lands: true }]))
-    } else if env.late.as_ref().is_some_and(lands) {
-        Some(Vec::from([
-            EnvAction::LateAppendLands,
-            EnvAction::Crash {
-                append_lands: false,
-            },
-        ]))
-    } else if log_len == tail {
-        Some(Vec::from([EnvAction::Crash {
-            append_lands: false,
-        }]))
-    } else {
-        None
+        explanations.push(Vec::from([EnvAction::Crash { append_lands: true }]));
     }
+    for (index, late) in env.late.iter().enumerate() {
+        if lands(late) {
+            explanations.push(Vec::from([
+                EnvAction::LateAppendLands(index),
+                EnvAction::Crash {
+                    append_lands: false,
+                },
+            ]));
+        }
+    }
+    if log_len == tail {
+        explanations.push(Vec::from([EnvAction::Crash {
+            append_lands: false,
+        }]));
+    }
+    explanations
 }
 
 fn end_of(pending: &Pending) -> Offset {
