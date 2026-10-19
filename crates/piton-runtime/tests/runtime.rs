@@ -418,3 +418,125 @@ async fn a_lost_append_reply_is_survived_by_recovering_from_the_log() {
     assert_eq!(lives, 2, "the session recovered once: {records:#?}");
     harness.assert_journal_replays();
 }
+
+/// Fails the append that admits `request-late`, but only once a tool is
+/// finishing, so the failure reaches the session's queue just ahead of the
+/// tool's result.
+#[derive(Debug, Default)]
+struct FailsBesideATool {
+    inner: MemLogStore,
+    append_started: tokio::sync::Notify,
+    tool_finishing: tokio::sync::Notify,
+    failing: tokio::sync::Notify,
+    failed: AtomicUsize,
+}
+
+#[async_trait]
+impl LogStore for FailsBesideATool {
+    async fn read(&self, session: &SessionId, from: Offset) -> Result<Vec<Record>, StoreError> {
+        self.inner.read(session, from).await
+    }
+
+    async fn append(
+        &self,
+        session: &SessionId,
+        expected: Offset,
+        records: Vec<Record>,
+    ) -> Result<(), StoreError> {
+        let admits_late_request = records.iter().any(|record| {
+            matches!(&record.body, RecordBody::InputAdmitted { request_id, .. }
+                if request_id.as_str() == "request-late")
+        });
+        if admits_late_request && self.failed.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.append_started.notify_one();
+            self.tool_finishing.notified().await;
+            // Wakes the tool in the same poll that reports the failure, so
+            // its result is queued right behind it.
+            self.failing.notify_one();
+            return Err(StoreError::new("failed beside a tool".to_owned()));
+        }
+        self.inner.append(session, expected, records).await
+    }
+}
+
+/// The first run of `search` waits until the append is under way, lets the
+/// store fail it, then returns.
+#[derive(Debug)]
+struct FinishesBesideAFailure {
+    store: Arc<FailsBesideATool>,
+    runs: AtomicUsize,
+}
+
+#[async_trait]
+impl ToolHost for FinishesBesideAFailure {
+    async fn run(
+        &self,
+        _effect: EffectId,
+        _call: ToolCall,
+        _cancel: CancelSignal,
+    ) -> ToolCompletion {
+        if self.runs.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.store.append_started.notified().await;
+            self.store.tool_finishing.notify_one();
+            self.store.failing.notified().await;
+        }
+        ToolCompletion::Returned {
+            output: Json::string("found it"),
+            is_error: false,
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_result_from_before_a_recovery_is_ignored() {
+    let store = Arc::new(FailsBesideATool::default());
+    let journal = Arc::new(Journal::default());
+    let journal_port: Arc<dyn TelemetryJournal> = Arc::<Journal>::clone(&journal);
+    let runtime = Runtime::new(Ports {
+        store: Arc::<FailsBesideATool>::clone(&store),
+        model: Arc::new(ScriptedModel::new([Ok(use_tool("search"))])),
+        tools: Arc::new(FinishesBesideAFailure {
+            store: Arc::clone(&store),
+            runs: AtomicUsize::new(0),
+        }),
+        clock: Arc::new(TokioClock::starting_at(Timestamp::EPOCH)),
+        journal: journal_port,
+    });
+    let session = runtime
+        .create(
+            SessionId::new("session".to_owned()),
+            tool_specs(),
+            MODEL_POLICY,
+        )
+        .await
+        .expect("the session is created");
+    let harness = Harness { session, journal };
+    harness.submit("find piton").await;
+    harness
+        .records_until(|body| matches!(body, RecordBody::ToolIntent { .. }))
+        .await;
+    harness
+        .session
+        .submit(
+            RequestId::new("request-late".to_owned()),
+            "and then".to_owned(),
+        )
+        .await
+        .expect("the session accepts input");
+    // The failed append lost `request-late`; the first turn still finishes,
+    // after the old life's result and the new life's are both handled.
+    let records = harness.records_until(turn_ended).await;
+    assert!(
+        store.failed.load(Ordering::SeqCst) > 0,
+        "the append failed beside the tool"
+    );
+    assert_eq!(
+        tool_outcomes(&records),
+        [ToolOutcome::Returned {
+            output: Json::string("found it"),
+            is_error: false,
+        }],
+        "the tool's result is recorded once"
+    );
+    harness.assert_journal_replays();
+}

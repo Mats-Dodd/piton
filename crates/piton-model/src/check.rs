@@ -429,15 +429,9 @@ fn check_tool_outcome(
     // once its grace period after either ran out.
     let late = match safety {
         Safety::Idempotent => context.cancelled.is_some() || context.at >= timeout,
-        Safety::Unsafe => {
-            let grace = spec.cancel_grace;
-            let after_cancel = context
-                .cancelled
-                .map(|(_, cancelled_at)| cancelled_at.after(grace));
-            let hard =
-                after_cancel.map_or(timeout.after(grace), |due| due.min(timeout.after(grace)));
-            context.at >= hard
-        }
+        Safety::Unsafe => env
+            .cancel_sent(effect)
+            .is_some_and(|asked| context.at >= asked.after(spec.cancel_grace)),
     };
     let check_reason = |reason: &StopReason| match reason {
         StopReason::TurnCancelled if context.cancelled.is_none() => {
@@ -484,22 +478,19 @@ fn check_tool_outcome(
         ToolOutcome::Unknown {
             cause: UnknownCause::Abandoned,
         } => {
-            let grace = spec.cancel_grace;
-            let after_cancel = context
-                .cancelled
-                .map(|(_, cancelled_at)| cancelled_at.after(grace));
             let earliest = match *safety {
-                Safety::Unsafe => {
-                    let after_timeout = timeout.after(grace);
-                    after_cancel.map_or(after_timeout, |due| due.min(after_timeout))
-                }
-                Safety::Idempotent => after_cancel.map_or(timeout, |due| due.min(timeout)),
+                // An unsafe tool is asked to stop first, and gets its whole
+                // grace period from then.
+                Safety::Unsafe => env
+                    .cancel_sent(effect)
+                    .ok_or(Violation::MissingCancel(effect))?
+                    .after(spec.cancel_grace),
+                Safety::Idempotent => context
+                    .cancelled
+                    .map_or(timeout, |(_, cancelled_at)| cancelled_at.min(timeout)),
             };
             if premature(earliest) {
                 return Err(Violation::PrematureTimeout(effect));
-            }
-            if *safety == Safety::Unsafe && grace > Millis::ZERO && !env.cancel_sent(effect) {
-                return Err(Violation::MissingCancel(effect));
             }
         }
         ToolOutcome::UnknownTool => return Err(Violation::UnfaithfulOutcome(effect)),
@@ -562,17 +553,22 @@ fn check_nothing_overdue(
             Some((Safety::Unsafe, Some(spec))) => {
                 let stop = intent.at.after(spec.timeout);
                 let ask = cancelled.map_or(stop, |at| at.min(stop));
-                if spec.cancel_grace > Millis::ZERO
-                    && now >= ask
-                    && env.running(*effect)
-                    && !env.stopping(*effect)
-                {
-                    return Err(Violation::MissingCancel(*effect));
+                match (env.running(*effect), env.stopping(*effect)) {
+                    // Asked to stop: abandoned once its grace from then is up.
+                    (true, true) => env
+                        .cancel_sent(*effect)
+                        .map_or(ask, |asked| asked.after(spec.cancel_grace)),
+                    // Running and past its time: it must have been asked.
+                    (true, false) if now >= ask => {
+                        return Err(Violation::MissingCancel(*effect));
+                    }
+                    (true, false) => {
+                        wake_by(ask);
+                        continue;
+                    }
+                    // Never started: not run once its time is up.
+                    (false, _) => ask,
                 }
-                if !env.stopping(*effect) {
-                    wake_by(ask);
-                }
-                ask.after(spec.cancel_grace)
             }
         };
         if now >= due {

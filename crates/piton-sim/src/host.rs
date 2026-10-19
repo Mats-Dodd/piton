@@ -9,7 +9,7 @@ use piton_runtime::{Follower, Ports, Runtime, SessionHandle};
 
 use crate::{
     MODEL_POLICY,
-    ports::{Journal, Model, SimClock, Store, Tools},
+    ports::{Journal, Model, SimClock, SkewedClock, Store, Tools},
     tools,
     world::SimWorld,
 };
@@ -25,7 +25,7 @@ pub(crate) async fn run(world: Arc<SimWorld>) -> turmoil::Result {
         store: Arc::new(Store(Arc::clone(&world))),
         model: Arc::new(Model(Arc::clone(&world))),
         tools: Arc::new(Tools(Arc::clone(&world))),
-        clock: Arc::new(SimClock),
+        clock: Arc::new(SkewedClock(Arc::clone(&world))),
         journal: Arc::new(Journal(Arc::clone(&world))),
     });
     loop {

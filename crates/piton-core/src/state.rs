@@ -72,14 +72,44 @@ pub(crate) enum Kind {
     UnknownTool,
 }
 
-/// When an open effect's time runs out.
+/// When an open effect's time runs out, as far as the log can say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Timers {
     /// An unsafe tool's timeout: past it, the tool is asked to stop (or, if
-    /// it never started, is not run).
+    /// it never started, is not run). Its grace period then runs from when
+    /// it is asked, which only the live session knows.
     pub(crate) soft: Option<Timestamp>,
     /// Past it, the session resolves the effect without waiting any longer.
     pub(crate) hard: Option<Timestamp>,
+}
+
+impl OpenEffect {
+    /// When the effect runs out of time, as far as the log can say.
+    pub(crate) const fn timers(&self) -> Timers {
+        match self.kind {
+            Kind::Model { timeout }
+            | Kind::Tool {
+                safety: Safety::Idempotent,
+                timeout,
+                ..
+            } => Timers {
+                soft: None,
+                hard: Some(self.at.after(timeout)),
+            },
+            Kind::Tool {
+                safety: Safety::Unsafe,
+                timeout,
+                ..
+            } => Timers {
+                soft: Some(self.at.after(timeout)),
+                hard: None,
+            },
+            Kind::UnknownTool => Timers {
+                soft: None,
+                hard: None,
+            },
+        }
+    }
 }
 
 impl SessionState {
@@ -309,40 +339,6 @@ impl SessionState {
         RecordBody::ModelIntent {
             turn,
             request: self.transcript.request(),
-        }
-    }
-
-    /// When `open` runs out of time, given the state of its turn.
-    pub(crate) fn timers(&self, open: &OpenEffect) -> Timers {
-        match open.kind {
-            Kind::Model { timeout }
-            | Kind::Tool {
-                safety: Safety::Idempotent,
-                timeout,
-                ..
-            } => Timers {
-                soft: None,
-                hard: Some(open.at.after(timeout)),
-            },
-            Kind::Tool {
-                safety: Safety::Unsafe,
-                timeout,
-                grace,
-            } => {
-                let soft = open.at.after(timeout);
-                let abandon = soft.after(grace);
-                let hard = self
-                    .cancelled_at(open.turn)
-                    .map_or(abandon, |cancelled| abandon.min(cancelled.after(grace)));
-                Timers {
-                    soft: Some(soft),
-                    hard: Some(hard),
-                }
-            }
-            Kind::UnknownTool => Timers {
-                soft: None,
-                hard: None,
-            },
         }
     }
 

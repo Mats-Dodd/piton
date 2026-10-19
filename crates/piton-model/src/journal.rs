@@ -112,7 +112,7 @@ fn replay(world: &World, entry: &JournalEntry) -> Vec<Result<World, DivergenceRe
             input,
             submissions,
         } => {
-            world.advance_to(*now);
+            world.clock_reads(*now);
             let action = match input {
                 Input::Tick => EnvAction::Tick { at: *now },
                 Input::Appended { .. }
@@ -134,7 +134,7 @@ fn replay(world: &World, entry: &JournalEntry) -> Vec<Result<World, DivergenceRe
             log_len,
             submissions,
         } => {
-            world.advance_to(*now);
+            world.clock_reads(*now);
             let explanations = recoveries(&world, *log_len);
             if explanations.is_empty() {
                 return Vec::from([Err(DivergenceReason::UnexplainedRecovery {

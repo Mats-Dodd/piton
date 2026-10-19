@@ -38,6 +38,7 @@ planted-bug:
 # seeds tokio's own randomness; a separate target dir keeps the normal build
 # cache intact.
 sim:
+    RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/sim cargo clippy -p piton-sim --all-targets -- -D warnings
     RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/sim cargo nextest run -p piton-sim --profile ci
 
 docs:

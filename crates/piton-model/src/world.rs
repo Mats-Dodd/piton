@@ -226,7 +226,7 @@ pub struct Env {
     /// Every completion the shell delivered, by effect, in any life.
     delivered: BTreeMap<EffectId, Vec<Input>>,
     /// Tools the session ever asked to stop.
-    cancels_sent: BTreeSet<EffectId>,
+    cancels_sent: BTreeMap<EffectId, Timestamp>,
     /// The session's log length when it last dispatched each effect.
     dispatched_at: BTreeMap<EffectId, Offset>,
     stalls: u8,
@@ -284,7 +284,7 @@ impl World {
             started: BTreeSet::new(),
             stopped: BTreeSet::new(),
             delivered: BTreeMap::new(),
-            cancels_sent: BTreeSet::new(),
+            cancels_sent: BTreeMap::new(),
             dispatched_at: BTreeMap::new(),
             stalls: 0,
             submits: 0,
@@ -313,9 +313,11 @@ impl World {
         &self.env
     }
 
-    /// Moves the environment's clock to `now`, unless it is already later.
-    pub fn advance_to(&mut self, now: Timestamp) {
-        self.env.now = self.env.now.max(now);
+    /// Sets the environment's clock to what a shell's clock read, which may
+    /// be earlier than before: wall clocks go backwards, and a restarted
+    /// session's clock starts from the wall clock, not from its last life.
+    pub const fn clock_reads(&mut self, now: Timestamp) {
+        self.env.now = now;
     }
 }
 
@@ -364,10 +366,10 @@ impl Env {
         self.delivered.get(&effect).map_or(&[], Vec::as_slice)
     }
 
-    /// Whether the session ever asked `effect` to stop.
+    /// When the session last asked `effect` to stop, by its own clock.
     #[must_use]
-    pub fn cancel_sent(&self, effect: EffectId) -> bool {
-        self.cancels_sent.contains(&effect)
+    pub fn cancel_sent(&self, effect: EffectId) -> Option<Timestamp> {
+        self.cancels_sent.get(&effect).copied()
     }
 
     /// Whether `effect` is running now.
@@ -436,7 +438,7 @@ impl Env {
     fn drain(&mut self, session: &mut Session) -> Vec<Submission> {
         let mut submissions = Vec::new();
         while let Some(submission) = session.poll_submission() {
-            if let Err(violation) = self.accept(&submission, session.log_len()) {
+            if let Err(violation) = self.accept(&submission, session.log_len(), session.now()) {
                 self.violation.get_or_insert(violation);
             }
             submissions.push(submission);
@@ -444,7 +446,12 @@ impl Env {
         submissions
     }
 
-    fn accept(&mut self, submission: &Submission, log_len: Offset) -> Result<(), Violation> {
+    fn accept(
+        &mut self,
+        submission: &Submission,
+        log_len: Offset,
+        now: Timestamp,
+    ) -> Result<(), Violation> {
         match submission {
             Submission::Append { expected, records } => {
                 if self.in_flight.is_some() {
@@ -497,7 +504,7 @@ impl Env {
                     return Err(Violation::CancelUndispatched(*effect));
                 }
                 self.cancel_requested.insert(*effect);
-                self.cancels_sent.insert(*effect);
+                self.cancels_sent.insert(*effect, now);
             }
             Submission::Abandon { effect } => {
                 let dropped = self

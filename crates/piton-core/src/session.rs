@@ -1,5 +1,5 @@
 use alloc::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     string::{String, ToString as _},
     vec::Vec,
 };
@@ -33,8 +33,10 @@ pub struct Session {
     unsubmitted: Vec<Record>,
     /// Effects handed to the shell that have not completed.
     dispatched: BTreeSet<EffectId>,
-    /// Dispatched tools the shell has been asked to stop.
-    cancelling: BTreeSet<EffectId>,
+    /// Dispatched tools the shell has been asked to stop, and when. Their
+    /// grace period runs from then, so a session that notices a timeout
+    /// late still gives the tool its full grace.
+    cancelling: BTreeMap<EffectId, Timestamp>,
     outbox: VecDeque<Submission>,
     now: Timestamp,
 }
@@ -62,7 +64,7 @@ impl Session {
             in_flight: None,
             unsubmitted: Vec::new(),
             dispatched: BTreeSet::new(),
-            cancelling: BTreeSet::new(),
+            cancelling: BTreeMap::new(),
             outbox: VecDeque::new(),
             now: now.max(last_at),
         };
@@ -139,7 +141,7 @@ impl Session {
             }
             Input::EffectCancelled { effect } => {
                 let reason = self.stop_reason(effect);
-                if self.cancelling.contains(&effect) && self.complete(effect, false) {
+                if self.cancelling.contains_key(&effect) && self.complete(effect, false) {
                     self.produce(RecordBody::ToolResolved {
                         effect,
                         outcome: ToolOutcome::Stopped { reason },
@@ -174,9 +176,10 @@ impl Session {
     pub fn deadline(&self) -> Option<Timestamp> {
         let mut earliest = self.state.backoff_until();
         for (id, open) in self.state.open_effects() {
-            let timers = self.state.timers(open);
-            let soft = timers.soft.filter(|_| !self.cancelling.contains(id));
-            for deadline in [soft, timers.hard].into_iter().flatten() {
+            let timers = open.timers();
+            let soft = timers.soft.filter(|_| !self.cancelling.contains_key(id));
+            let abandon = self.abandon_at(*id, open);
+            for deadline in [soft, timers.hard, abandon].into_iter().flatten() {
                 earliest = Some(earliest.map_or(deadline, |current| current.min(deadline)));
             }
         }
@@ -270,10 +273,30 @@ impl Session {
     /// Produces every record due at the session's clock, then hands the
     /// shell what is now safe to do.
     fn drive(&mut self) {
-        self.produce_due();
+        // Asking a tool to stop starts its grace period, which may already
+        // be over (a grace of zero), so produce again until nothing changes.
+        loop {
+            self.produce_due();
+            if !self.cancel_overdue_tools() {
+                break;
+            }
+        }
         self.dispatch_durable_intents();
-        self.cancel_overdue_tools();
         self.flush();
+    }
+
+    /// When an unsafe tool that has been asked to stop is abandoned: its
+    /// grace period after the request.
+    fn abandon_at(&self, id: EffectId, open: &OpenEffect) -> Option<Timestamp> {
+        let Kind::Tool {
+            safety: Safety::Unsafe,
+            grace,
+            ..
+        } = open.kind
+        else {
+            return None;
+        };
+        self.cancelling.get(&id).map(|asked| asked.after(grace))
     }
 
     fn produce_due(&mut self) {
@@ -302,7 +325,7 @@ impl Session {
     fn decide(&self, id: EffectId, open: &OpenEffect) -> Option<RecordBody> {
         let cancelled = self.state.cancelled_at(open.turn).is_some();
         let started = self.dispatched.contains(&id) || id.intent() < self.recovered;
-        let timers = self.state.timers(open);
+        let timers = open.timers();
         let passed = |deadline: Option<Timestamp>| deadline.is_some_and(|due| self.now >= due);
         let tool = |outcome| {
             Some(RecordBody::ToolResolved {
@@ -345,7 +368,7 @@ impl Session {
                 (Safety::Idempotent, true, Some(_)) => tool(ToolOutcome::Unknown {
                     cause: UnknownCause::Abandoned,
                 }),
-                (Safety::Unsafe, true, Some(_)) if passed(timers.hard) => {
+                (Safety::Unsafe, true, Some(_)) if passed(self.abandon_at(id, open)) => {
                     tool(ToolOutcome::Unknown {
                         cause: UnknownCause::Abandoned,
                     })
@@ -378,20 +401,18 @@ impl Session {
     }
 
     /// Asks running unsafe tools to stop once their turn is cancelled or
-    /// their timeout passes; their grace period runs from then.
-    fn cancel_overdue_tools(&mut self) {
+    /// their timeout passes; their grace period runs from then. Returns
+    /// whether it asked any.
+    fn cancel_overdue_tools(&mut self) -> bool {
         let overdue: Vec<EffectId> = self
             .dispatched
-            .difference(&self.cancelling)
+            .iter()
+            .filter(|id| !self.cancelling.contains_key(id))
             .copied()
             .filter(|id| {
                 self.state.open_effects().get(id).is_some_and(|open| {
                     let overdue = self.state.cancelled_at(open.turn).is_some()
-                        || self
-                            .state
-                            .timers(open)
-                            .soft
-                            .is_some_and(|due| self.now >= due);
+                        || open.timers().soft.is_some_and(|due| self.now >= due);
                     overdue
                         && matches!(
                             open.kind,
@@ -403,10 +424,12 @@ impl Session {
                 })
             })
             .collect();
+        let asked = !overdue.is_empty();
         for effect in overdue {
-            self.cancelling.insert(effect);
+            self.cancelling.insert(effect, self.now);
             self.outbox.push_back(Submission::Cancel { effect });
         }
+        asked
     }
 
     fn flush(&mut self) {

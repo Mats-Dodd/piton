@@ -3,7 +3,7 @@
 //! really did.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     sync::{
         Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -11,21 +11,30 @@ use std::{
 };
 
 use piton_core::JournalEntry;
-use piton_domain::{EffectId, Json, Offset, Record, RequestId, SessionId, Timestamp, TurnId};
-use piton_runtime::MemLogStore;
+use piton_domain::{
+    EffectId, Json, ModelResponse, Offset, Record, RequestId, SessionId, Timestamp, TurnId,
+};
+use piton_runtime::{MemLogStore, ModelError};
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 
 use crate::Plan;
 
-/// What a tool really did, whatever the log says.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ToolRun {
-    /// How many times the tool host started it, across every life.
-    pub starts: u32,
-    /// Everything it returned.
-    pub outputs: Vec<Json>,
-    /// Whether it stopped because it was asked to.
-    pub stopped: bool,
+/// Something a simulated port really did, whatever the log says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Truth {
+    /// How many journal entries existed when it happened: it happened after
+    /// the entry at `seen - 1` was written and before the entry at `seen`.
+    pub seen: usize,
+    pub effect: EffectId,
+    pub event: Happened,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Happened {
+    ToolStarted,
+    ToolReturned { output: Json, is_error: bool },
+    ToolStopped,
+    ModelReplied(Result<ModelResponse, ModelError>),
 }
 
 /// An append storage will apply later, after the runtime gave up on it.
@@ -51,7 +60,9 @@ pub(crate) struct SimWorld {
     rng: Mutex<StdRng>,
     faults: AtomicBool,
     journal: Mutex<Vec<JournalEntry>>,
-    truth: Mutex<BTreeMap<EffectId, ToolRun>>,
+    truth: Mutex<Vec<Truth>>,
+    /// How far simulated clocks run ahead of simulated time, in ms.
+    skew: Mutex<u64>,
     late: Mutex<Vec<LateAppend>>,
     late_landed: Mutex<u32>,
     seen: Mutex<Seen>,
@@ -66,7 +77,8 @@ impl SimWorld {
             rng: Mutex::new(StdRng::seed_from_u64(seed)),
             faults: AtomicBool::new(true),
             journal: Mutex::new(Vec::new()),
-            truth: Mutex::new(BTreeMap::new()),
+            truth: Mutex::new(Vec::new()),
+            skew: Mutex::new(0),
             late: Mutex::new(Vec::new()),
             late_landed: Mutex::new(0),
             seen: Mutex::new(Seen::default()),
@@ -105,27 +117,27 @@ impl SimWorld {
         lock(&self.journal).clone()
     }
 
-    pub(crate) fn tool_started(&self, effect: EffectId) {
-        let mut truth = lock(&self.truth);
-        let run = truth.entry(effect).or_default();
-        run.starts = run.starts.saturating_add(1);
-        drop(truth);
+    /// Records what a port really did, after the journal entries written so
+    /// far.
+    pub(crate) fn happened(&self, effect: EffectId, event: Happened) {
+        let seen = lock(&self.journal).len();
+        lock(&self.truth).push(Truth {
+            seen,
+            effect,
+            event,
+        });
     }
 
-    pub(crate) fn tool_returned(&self, effect: EffectId, output: Json) {
-        lock(&self.truth)
-            .entry(effect)
-            .or_default()
-            .outputs
-            .push(output);
-    }
-
-    pub(crate) fn tool_stopped(&self, effect: EffectId) {
-        lock(&self.truth).entry(effect).or_default().stopped = true;
-    }
-
-    pub(crate) fn truth(&self) -> BTreeMap<EffectId, ToolRun> {
+    pub(crate) fn truth(&self) -> Vec<Truth> {
         lock(&self.truth).clone()
+    }
+
+    pub(crate) fn skew(&self) -> u64 {
+        *lock(&self.skew)
+    }
+
+    pub(crate) fn set_skew(&self, millis: u64) {
+        *lock(&self.skew) = millis;
     }
 
     /// Storage will try to apply `records` at `expected` once `due` passes.

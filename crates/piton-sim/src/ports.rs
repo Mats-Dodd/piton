@@ -14,11 +14,14 @@ use piton_runtime::{
     ToolCompletion, ToolHost,
 };
 
-use crate::world::SimWorld;
+use crate::world::{Happened, SimWorld};
 
-/// Waits a random `low..high` milliseconds of simulated time.
+/// Waits a random `low..high` milliseconds of simulated time, in steps of
+/// five so that events often coincide and race.
 async fn delay(world: &SimWorld, low: u64, high: u64) {
-    tokio::time::sleep(Duration::from_millis(world.pick(low, high))).await;
+    let millis = world.pick(low, high);
+    let coarse = millis.saturating_sub(millis.checked_rem(5).unwrap_or(0));
+    tokio::time::sleep(Duration::from_millis(coarse)).await;
 }
 
 /// Storage that is slow, rejects appends, loses replies and applies appends
@@ -55,7 +58,8 @@ impl LogStore for Store {
             return Err(StoreError::new("reply lost".to_owned()));
         }
         if self.0.fault(30) {
-            let due = SimClock.now().after(Millis::new(self.0.pick(1, 40)));
+            let due =
+                Timestamp::from_millis(SimClock::millis()).after(Millis::new(self.0.pick(1, 40)));
             self.0.delay_append(expected, records, due);
             delay(&self.0, 0, 10).await;
             return Err(StoreError::new("timed out".to_owned()));
@@ -76,6 +80,19 @@ impl ModelProvider for Model {
         &self,
         effect: EffectId,
         request: ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        let reply = self.reply(effect, &request).await;
+        self.0
+            .happened(effect, Happened::ModelReplied(reply.clone()));
+        reply
+    }
+}
+
+impl Model {
+    async fn reply(
+        &self,
+        effect: EffectId,
+        request: &ModelRequest,
     ) -> Result<ModelResponse, ModelError> {
         let world = &self.0;
         delay(world, 1, 15).await;
@@ -136,7 +153,7 @@ pub(crate) struct Tools(pub(crate) Arc<SimWorld>);
 impl ToolHost for Tools {
     async fn run(&self, effect: EffectId, call: ToolCall, cancel: CancelSignal) -> ToolCompletion {
         let world = &self.0;
-        world.tool_started(effect);
+        world.happened(effect, Happened::ToolStarted);
         let millis = if world.fault(200) {
             200
         } else {
@@ -147,11 +164,11 @@ impl ToolHost for Tools {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(millis)) => {
                 let output = Json::string(&format!("{} done", call.name.as_str()));
-                world.tool_returned(effect, output.clone());
+                world.happened(effect, Happened::ToolReturned { output: output.clone(), is_error });
                 ToolCompletion::Returned { output, is_error }
             }
             () = cancel.cancelled(), if honours_cancel => {
-                world.tool_stopped(effect);
+                world.happened(effect, Happened::ToolStopped);
                 ToolCompletion::Stopped
             }
         }
@@ -170,9 +187,15 @@ impl SimClock {
     }
 }
 
-impl Clock for SimClock {
+/// The runtime's clock: simulated time, but jumping ahead and back as the
+/// simulation skews it, as wall clocks do. A jump ahead makes results
+/// arrive after deadlines the runtime has not yet noticed.
+#[derive(Debug)]
+pub(crate) struct SkewedClock(pub(crate) Arc<SimWorld>);
+
+impl Clock for SkewedClock {
     fn now(&self) -> Timestamp {
-        Timestamp::from_millis(Self::millis())
+        Timestamp::from_millis(SimClock::millis().saturating_add(self.0.skew()))
     }
 }
 
