@@ -65,6 +65,7 @@ impl Transcript {
                 }
             }
             RecordBody::SessionCreated { .. }
+            | RecordBody::SessionResumed
             | RecordBody::ModelIntent { .. }
             | RecordBody::ModelResolved { .. }
             | RecordBody::TurnCancelled { .. }

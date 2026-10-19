@@ -1,45 +1,52 @@
 use alloc::{
     collections::{BTreeSet, VecDeque},
-    string::ToString as _,
+    string::{String, ToString as _},
     vec::Vec,
 };
 
 use piton_domain::{
-    EffectId, ModelOutcome, Offset, Record, RecordBody, Timestamp, ToolOutcome, TurnId,
+    EffectId, ModelOutcome, Offset, Record, RecordBody, Safety, StopReason, Timestamp, ToolOutcome,
+    TurnId, UnknownCause,
 };
 
 use crate::{
     Effect, Input, Submission,
-    state::{RecoveryError, SessionState, resolution},
+    state::{Kind, OpenEffect, RecoveryError, SessionState},
 };
 
 /// One agent session: a deterministic state machine over its log.
 ///
 /// Drive it by calling [`Session::handle`] and then draining
-/// [`Session::poll_submission`] until it returns `None`.
+/// [`Session::poll_submission`] until it returns `None`. When
+/// [`Session::deadline`] passes, send [`Input::Tick`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Session {
     state: SessionState,
     /// Log length storage has acknowledged.
     durable: Offset,
+    /// Log length this session recovered from. Effects declared before it
+    /// may have started in an earlier life of the session.
+    recovered: Offset,
     /// End of the outstanding append, if there is one.
     in_flight: Option<Offset>,
     /// Records produced but not yet handed to storage.
     unsubmitted: Vec<Record>,
     /// Effects handed to the shell that have not completed.
     dispatched: BTreeSet<EffectId>,
-    /// Dispatched effects the shell has been asked to cancel.
+    /// Dispatched tools the shell has been asked to stop.
     cancelling: BTreeSet<EffectId>,
     outbox: VecDeque<Submission>,
     now: Timestamp,
 }
 
 impl Session {
-    /// Recovers a session from its durable log.
+    /// Recovers a session from its durable log, starting a new life of it.
     ///
-    /// Tool calls that may have run before the restart and must not repeat
-    /// are resolved as interrupted; everything else carries on, and open
-    /// effects are dispatched again under their original ids.
+    /// The session first appends `SessionResumed` and dispatches nothing
+    /// until that append is durable: an append from an earlier life could
+    /// otherwise land later and contradict what this life does. Unsafe tools
+    /// that may have run before the restart are resolved as unknown; every
+    /// other open effect is dispatched again under its original id.
     ///
     /// # Errors
     ///
@@ -47,9 +54,10 @@ impl Session {
     pub fn from_log(now: Timestamp, records: &[Record]) -> Result<Self, RecoveryError> {
         let state = SessionState::fold(records)?;
         let last_at = records.last().map_or(Timestamp::EPOCH, |record| record.at);
-        let interrupted: Vec<EffectId> = state.interrupted_by_restart().collect();
+        let restarted: Vec<EffectId> = state.unsafe_tools().collect();
         let mut session = Self {
             durable: state.next_offset(),
+            recovered: state.next_offset(),
             state,
             in_flight: None,
             unsubmitted: Vec::new(),
@@ -58,17 +66,22 @@ impl Session {
             outbox: VecDeque::new(),
             now: now.max(last_at),
         };
-        for effect in interrupted {
+        session.produce(RecordBody::SessionResumed);
+        for effect in restarted {
             session.produce(RecordBody::ToolResolved {
                 effect,
-                outcome: ToolOutcome::Interrupted,
+                outcome: ToolOutcome::Unknown {
+                    cause: UnknownCause::Restart,
+                },
             });
         }
         session.drive();
         Ok(session)
     }
 
-    /// Feeds one input to the session. `now` never moves the session's clock
+    /// Feeds one input to the session at `now`. Timers due by `now` fire
+    /// first, so the outcome never depends on whether the shell noticed the
+    /// time or the input first. `now` never moves the session's clock
     /// backwards.
     ///
     /// # Panics
@@ -76,6 +89,7 @@ impl Session {
     /// Panics if the shell acknowledges an append that is not outstanding.
     pub fn handle(&mut self, now: Timestamp, input: Input) {
         self.now = self.now.max(now);
+        self.produce_due();
         match input {
             Input::Appended { end } => {
                 assert_eq!(
@@ -87,25 +101,32 @@ impl Session {
                 self.in_flight = None;
             }
             Input::ModelResponded { effect, response } => {
-                if let Some(turn) = self.complete(effect, true) {
-                    let outcome = if self.state.is_cancelled(turn) {
-                        ModelOutcome::Cancelled
-                    } else {
-                        match response.validate() {
-                            Ok(()) => ModelOutcome::Responded { response },
-                            Err(invalid) => ModelOutcome::Failed {
-                                reason: invalid.to_string(),
-                            },
-                        }
+                if self.complete(effect, true) {
+                    let outcome = match response.validate() {
+                        Ok(()) => ModelOutcome::Responded { response },
+                        Err(invalid) => ModelOutcome::Failed {
+                            reason: invalid.to_string(),
+                            retryable: false,
+                            retry_after: None,
+                        },
                     };
                     self.produce(RecordBody::ModelResolved { effect, outcome });
                 }
             }
-            Input::ModelFailed { effect, reason } => {
-                if self.complete(effect, true).is_some() {
+            Input::ModelFailed {
+                effect,
+                reason,
+                retryable,
+                retry_after,
+            } => {
+                if self.complete(effect, true) {
                     self.produce(RecordBody::ModelResolved {
                         effect,
-                        outcome: ModelOutcome::Failed { reason },
+                        outcome: ModelOutcome::Failed {
+                            reason,
+                            retryable,
+                            retry_after,
+                        },
                     });
                 }
             }
@@ -114,7 +135,7 @@ impl Session {
                 output,
                 is_error,
             } => {
-                if self.complete(effect, false).is_some() {
+                if self.complete(effect, false) {
                     self.produce(RecordBody::ToolResolved {
                         effect,
                         outcome: ToolOutcome::Returned { output, is_error },
@@ -122,12 +143,12 @@ impl Session {
                 }
             }
             Input::EffectCancelled { effect } => {
-                let is_model = self.is_model_call(effect);
-                if self.complete(effect, is_model).is_some()
-                    && let Some(open) = self.state.open_effects().get(&effect)
-                {
-                    let body = resolution(effect, open, ToolOutcome::Cancelled);
-                    self.produce(body);
+                let reason = self.stop_reason(effect);
+                if self.cancelling.contains(&effect) && self.complete(effect, false) {
+                    self.produce(RecordBody::ToolResolved {
+                        effect,
+                        outcome: ToolOutcome::Stopped { reason },
+                    });
                 }
             }
             Input::Submit { request_id, text } => {
@@ -136,10 +157,12 @@ impl Session {
                 }
             }
             Input::CancelTurn { turn } => {
-                if self.state.active_turn() == Some(turn) && !self.state.is_cancelled(turn) {
+                if self.state.active_turn() == Some(turn) && self.state.cancelled_at(turn).is_none()
+                {
                     self.produce(RecordBody::TurnCancelled { turn });
                 }
             }
+            Input::Tick => {}
         }
         self.drive();
     }
@@ -149,11 +172,20 @@ impl Session {
         self.outbox.pop_front()
     }
 
-    /// When the session next needs to hear from the shell even without input.
-    /// Nothing is time-driven yet.
+    /// When the session next needs to hear from the shell even if nothing
+    /// else happens: the earliest timeout, grace period or retry backoff.
+    /// Always later than the session's clock.
     #[must_use]
-    pub const fn deadline(&self) -> Option<Timestamp> {
-        None
+    pub fn deadline(&self) -> Option<Timestamp> {
+        let mut earliest = self.state.backoff_until();
+        for (id, open) in self.state.open_effects() {
+            let timers = self.state.timers(open);
+            let soft = timers.soft.filter(|_| !self.cancelling.contains(id));
+            for deadline in [soft, timers.hard].into_iter().flatten() {
+                earliest = Some(earliest.map_or(deadline, |current| current.min(deadline)));
+            }
+        }
+        earliest
     }
 
     #[must_use]
@@ -185,23 +217,31 @@ impl Session {
     }
 
     /// Accepts a completion for `effect` if it is outstanding and of the
-    /// expected kind, returning its turn. Anything else is stale and ignored.
-    fn complete(&mut self, effect: EffectId, is_model: bool) -> Option<TurnId> {
-        let open = self.state.open_effects().get(&effect)?;
+    /// expected kind. Anything else is stale and ignored.
+    fn complete(&mut self, effect: EffectId, is_model: bool) -> bool {
+        let Some(open) = self.state.open_effects().get(&effect) else {
+            return false;
+        };
         if matches!(open.effect, Effect::CallModel { .. }) != is_model
             || !self.dispatched.remove(&effect)
         {
-            return None;
+            return false;
         }
         self.cancelling.remove(&effect);
-        Some(open.turn)
+        true
     }
 
-    fn is_model_call(&self, effect: EffectId) -> bool {
-        self.state
+    fn stop_reason(&self, effect: EffectId) -> StopReason {
+        let cancelled = self
+            .state
             .open_effects()
             .get(&effect)
-            .is_some_and(|open| matches!(open.effect, Effect::CallModel { .. }))
+            .and_then(|open| self.state.cancelled_at(open.turn));
+        if cancelled.is_some() {
+            StopReason::TurnCancelled
+        } else {
+            StopReason::TimedOut
+        }
     }
 
     fn produce(&mut self, body: RecordBody) {
@@ -216,15 +256,96 @@ impl Session {
         self.unsubmitted.push(record);
     }
 
-    /// Produces every record the state calls for, then hands the shell what
-    /// is now safe to do.
-    fn drive(&mut self) {
-        while let Some(body) = self.state.next_record(&self.dispatched) {
-            self.produce(body);
+    /// Records an outcome the session decided without the effect, and drops
+    /// the effect if it is still running.
+    fn resolve(&mut self, effect: EffectId, body: RecordBody) {
+        self.produce(body);
+        if self.dispatched.remove(&effect) {
+            self.cancelling.remove(&effect);
+            self.outbox.push_back(Submission::Abandon { effect });
         }
+    }
+
+    /// Produces every record due at the session's clock, then hands the
+    /// shell what is now safe to do.
+    fn drive(&mut self) {
+        self.produce_due();
         self.dispatch_durable_intents();
-        self.cancel_dispatched();
+        self.cancel_overdue_tools();
         self.flush();
+    }
+
+    fn produce_due(&mut self) {
+        loop {
+            if let Some((effect, body)) = self.next_resolution() {
+                self.resolve(effect, body);
+            } else if let Some(body) = self.state.next_record(self.now) {
+                self.produce(body);
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn next_resolution(&self) -> Option<(EffectId, RecordBody)> {
+        self.state
+            .open_effects()
+            .iter()
+            .find_map(|(id, open)| self.decide(*id, open).map(|body| (*id, body)))
+    }
+
+    /// The outcome the session must record for `open` now, without waiting
+    /// for the effect, if any. Claims only what is known: an effect that may
+    /// have started is never reported as not run, and an unsafe tool that
+    /// has not confirmed it stopped is reported as unknown.
+    fn decide(&self, id: EffectId, open: &OpenEffect) -> Option<RecordBody> {
+        let cancelled = self.state.cancelled_at(open.turn).is_some();
+        let started = self.dispatched.contains(&id) || id.intent() < self.recovered;
+        let timers = self.state.timers(open);
+        let passed = |deadline: Option<Timestamp>| deadline.is_some_and(|due| self.now >= due);
+        let tool = |outcome| {
+            Some(RecordBody::ToolResolved {
+                effect: id,
+                outcome,
+            })
+        };
+        let reason = if cancelled {
+            Some(StopReason::TurnCancelled)
+        } else if passed(timers.soft.or(timers.hard)) {
+            Some(StopReason::TimedOut)
+        } else {
+            None
+        };
+        match open.kind {
+            Kind::UnknownTool => tool(ToolOutcome::UnknownTool),
+            Kind::Model { .. } => {
+                let outcome = if cancelled {
+                    ModelOutcome::Cancelled
+                } else if passed(timers.hard) {
+                    ModelOutcome::Failed {
+                        reason: String::from("timed out"),
+                        retryable: true,
+                        retry_after: None,
+                    }
+                } else {
+                    return None;
+                };
+                Some(RecordBody::ModelResolved {
+                    effect: id,
+                    outcome,
+                })
+            }
+            Kind::Tool { safety, .. } => match (safety, started, reason) {
+                (_, false, Some(reason)) => tool(ToolOutcome::NotRun { reason }),
+                (Safety::Idempotent, true, Some(reason)) => tool(ToolOutcome::Stopped { reason }),
+                (Safety::Unsafe, true, Some(_)) if passed(timers.hard) => {
+                    tool(ToolOutcome::Unknown {
+                        cause: UnknownCause::Abandoned,
+                    })
+                }
+                (Safety::Unsafe, true, Some(_)) | (_, _, None) => None,
+            },
+        }
     }
 
     fn dispatch_durable_intents(&mut self) {
@@ -233,8 +354,13 @@ impl Session {
             .open_effects()
             .iter()
             .filter(|(id, open)| {
-                let durable = cfg!(piton_planted_bug) || id.intent() < self.durable;
-                durable && !self.dispatched.contains(id) && !self.state.is_cancelled(open.turn)
+                // Write-ahead: the intent is durable, and so is this life's
+                // fence. The planted bug skips both.
+                let safe = id.intent() < self.durable && self.durable > self.recovered;
+                (safe || cfg!(piton_planted_bug))
+                    && !self.dispatched.contains(id)
+                    && self.state.cancelled_at(open.turn).is_none()
+                    && open.kind != Kind::UnknownTool
             })
             .map(|(_, open)| open.effect.clone())
             .collect();
@@ -244,21 +370,33 @@ impl Session {
         }
     }
 
-    /// Once a cancellation is durable, asks the shell to stop the turn's
-    /// dispatched effects.
-    fn cancel_dispatched(&mut self) {
-        let Some(cancelled_at) = self.state.cancelled_at() else {
-            return;
-        };
-        if cancelled_at >= self.durable {
-            return;
-        }
-        let to_cancel: Vec<EffectId> = self
+    /// Asks running unsafe tools to stop once their turn is cancelled or
+    /// their timeout passes; their grace period runs from then.
+    fn cancel_overdue_tools(&mut self) {
+        let overdue: Vec<EffectId> = self
             .dispatched
             .difference(&self.cancelling)
             .copied()
+            .filter(|id| {
+                self.state.open_effects().get(id).is_some_and(|open| {
+                    let overdue = self.state.cancelled_at(open.turn).is_some()
+                        || self
+                            .state
+                            .timers(open)
+                            .soft
+                            .is_some_and(|due| self.now >= due);
+                    overdue
+                        && matches!(
+                            open.kind,
+                            Kind::Tool {
+                                safety: Safety::Unsafe,
+                                ..
+                            }
+                        )
+                })
+            })
             .collect();
-        for effect in to_cancel {
+        for effect in overdue {
             self.cancelling.insert(effect);
             self.outbox.push_back(Submission::Cancel { effect });
         }

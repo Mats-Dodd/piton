@@ -3,8 +3,8 @@ use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EffectId, ModelOutcome, ModelRequest, Offset, ReplayPolicy, RequestId, Timestamp, ToolCall,
-    ToolOutcome, ToolSpec, TurnId,
+    EffectId, ModelOutcome, ModelPolicy, ModelRequest, Offset, RequestId, Safety, Timestamp,
+    ToolCall, ToolOutcome, ToolSpec, TurnId,
 };
 
 /// The log format version written into `SessionCreated`.
@@ -25,7 +25,12 @@ pub enum RecordBody {
     SessionCreated {
         schema: u32,
         tools: Vec<ToolSpec>,
+        model: ModelPolicy,
     },
+    /// A new life of the session began from the log before this record. Once
+    /// it is durable, no append from an earlier life can land, so the session
+    /// may act on what it recovered.
+    SessionResumed,
     /// A client submission, admitted at most once per request id. Queued until
     /// a turn picks it up.
     InputAdmitted {
@@ -45,11 +50,12 @@ pub enum RecordBody {
         effect: EffectId,
         outcome: ModelOutcome,
     },
-    /// Intent to run a tool. The effect's id is this record's offset.
+    /// Intent to run a tool. The effect's id is this record's offset. A tool
+    /// the session does not have is recorded as unsafe.
     ToolIntent {
         turn: TurnId,
         call: ToolCall,
-        replay: ReplayPolicy,
+        safety: Safety,
     },
     ToolResolved {
         effect: EffectId,
@@ -69,7 +75,8 @@ pub enum RecordBody {
 pub enum TurnEnd {
     /// The model replied without asking for tools.
     Completed,
-    /// A model call failed or returned something unusable.
+    /// A model call failed for good: it was not retryable, returned
+    /// something unusable, or ran out of attempts.
     Failed,
     Cancelled,
 }

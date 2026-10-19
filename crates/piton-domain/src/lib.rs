@@ -20,9 +20,14 @@ mod tool;
 mod transcript;
 
 pub use content::{ContentBlock, Message, Role};
-pub use id::{EffectId, Offset, RequestId, Timestamp, ToolName, ToolUseId, TurnId};
+pub use id::{
+    EffectId, Millis, Offset, RequestId, SessionId, Timestamp, ToolName, ToolUseId, TurnId,
+};
 pub use json::{InvalidJson, Json};
-pub use model::{InvalidResponse, MalformedRequest, ModelOutcome, ModelRequest, ModelResponse};
+pub use model::{
+    InvalidResponse, MalformedRequest, ModelOutcome, ModelPolicy, ModelRequest, ModelResponse,
+    RetryPolicy,
+};
 pub use record::{Record, RecordBody, SCHEMA_VERSION, TurnEnd};
-pub use tool::{ReplayPolicy, ToolCall, ToolOutcome, ToolSpec};
+pub use tool::{Safety, StopReason, ToolCall, ToolOutcome, ToolSpec, UnknownCause};
 pub use transcript::Transcript;

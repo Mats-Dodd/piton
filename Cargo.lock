@@ -239,7 +239,6 @@ dependencies = [
  "piton-core",
  "piton-domain",
  "proptest",
- "serde",
  "serde_json",
  "stateright",
 ]

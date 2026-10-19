@@ -3,7 +3,7 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentBlock, Message, Role, ToolCall, ToolUseId};
+use crate::{ContentBlock, Message, Millis, Role, ToolCall, ToolUseId};
 
 /// Everything a model call needs, fully determined by the log.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -203,7 +203,49 @@ impl core::error::Error for InvalidResponse {}
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ModelOutcome {
-    Responded { response: ModelResponse },
-    Failed { reason: String },
+    Responded {
+        response: ModelResponse,
+    },
+    /// The call failed or timed out. A retryable failure is tried again,
+    /// within the session's retry policy, after at least `retry_after`.
+    Failed {
+        reason: String,
+        retryable: bool,
+        retry_after: Option<Millis>,
+    },
     Cancelled,
+}
+
+/// How a session calls the model. Fixed when the session is created, so a
+/// log replays the same way whatever the current configuration says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelPolicy {
+    /// How long a call may take, from its intent, before it counts as failed.
+    pub timeout: Millis,
+    pub retry: RetryPolicy,
+}
+
+/// Exponential backoff between attempts at one model call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Attempts per call, counting the first. One means never retry.
+    pub max_attempts: u32,
+    pub initial_backoff: Millis,
+    pub max_backoff: Millis,
+}
+
+impl RetryPolicy {
+    /// The wait before attempt `failures + 1`, after `failures` consecutive
+    /// failures, before any jitter.
+    #[must_use]
+    pub fn backoff(&self, failures: u32) -> Millis {
+        let doublings = failures.saturating_sub(1);
+        let factor = 2u64.checked_pow(doublings).unwrap_or(u64::MAX);
+        Millis::new(
+            self.initial_backoff
+                .get()
+                .saturating_mul(factor)
+                .min(self.max_backoff.get()),
+        )
+    }
 }

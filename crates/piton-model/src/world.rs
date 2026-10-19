@@ -1,19 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use piton_core::{Effect, Input, Session, Submission};
+use piton_core::{Effect, Input, JournalEntry, Session, Submission};
 use piton_domain::{
-    ContentBlock, EffectId, Json, ModelResponse, Offset, Record, RecordBody, ReplayPolicy,
-    RequestId, SCHEMA_VERSION, Timestamp, ToolName, ToolSpec, ToolUseId, TurnId,
+    ContentBlock, EffectId, Json, Millis, ModelPolicy, ModelResponse, Offset, Record, RecordBody,
+    RequestId, RetryPolicy, SCHEMA_VERSION, Safety, Timestamp, ToolName, ToolSpec, ToolUseId,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::Violation;
 
-/// The tools a session has and how much nondeterminism the environment may
-/// inject. Not part of the explored state.
+/// The session's tools and model policy, and how much nondeterminism the
+/// generator may inject. Not part of the explored state.
 #[derive(Clone, Debug)]
 pub struct WorldConfig {
     pub tools: Vec<ToolSpec>,
+    pub model: ModelPolicy,
     /// Each entry is a reply the model may give: one tool use per name.
     /// Names outside `tools` exercise unknown-tool handling.
     pub tool_replies: Vec<Vec<ToolName>>,
@@ -21,30 +21,38 @@ pub struct WorldConfig {
     pub invalid_replies: bool,
     /// How many replies may ask for tools, across the whole run.
     pub tool_rounds: u8,
+    /// How many model calls may fail, across the whole run.
+    pub model_failures: u8,
     pub submits: u8,
     pub cancels: u8,
     pub crashes: u8,
-    pub advance_time: bool,
+    /// Deliver completions for effects the session already abandoned.
+    pub late_completions: bool,
+    /// Let an append given up on at a crash land afterwards.
+    pub late_appends: bool,
 }
 
 impl WorldConfig {
     /// Small enough for Stateright to explore every state, large enough to
-    /// reach parallel tools, an unknown tool, an invalid reply, a cancel and a
-    /// crash in one run.
+    /// reach parallel tools, an unknown tool, an invalid reply, a retry, a
+    /// timeout, a cancel, a late append and a crash in one run.
     #[must_use]
     pub fn exhaustive() -> Self {
         Self {
             tools: tools(),
+            model: model_policy(),
             tool_replies: Vec::from([
                 Vec::from([search(), send_email()]),
                 Vec::from([ToolName::new("missing".to_owned())]),
             ]),
             invalid_replies: true,
-            tool_rounds: 2,
-            submits: 2,
+            tool_rounds: 1,
+            model_failures: 1,
+            submits: 1,
             cancels: 1,
-            crashes: 2,
-            advance_time: false,
+            crashes: 1,
+            late_completions: true,
+            late_appends: true,
         }
     }
 
@@ -53,6 +61,7 @@ impl WorldConfig {
     pub fn deep() -> Self {
         Self {
             tools: tools(),
+            model: model_policy(),
             tool_replies: Vec::from([
                 Vec::from([search()]),
                 Vec::from([send_email()]),
@@ -60,92 +69,111 @@ impl WorldConfig {
                 Vec::from([ToolName::new("missing".to_owned()), search()]),
             ]),
             invalid_replies: true,
-            tool_rounds: 6,
-            submits: 4,
-            cancels: 2,
-            crashes: 3,
-            advance_time: true,
+            tool_rounds: 12,
+            model_failures: 6,
+            submits: 8,
+            cancels: 3,
+            crashes: 4,
+            late_completions: true,
+            late_appends: true,
         }
     }
 }
 
 /// A tool that is safe to run again.
-fn search() -> ToolName {
+#[must_use]
+pub fn search() -> ToolName {
     ToolName::new("search".to_owned())
 }
 
 /// A tool that must never run twice.
-fn send_email() -> ToolName {
+#[must_use]
+pub fn send_email() -> ToolName {
     ToolName::new("send_email".to_owned())
 }
 
-fn tools() -> Vec<ToolSpec> {
+/// The tools every preset gives its session.
+#[must_use]
+pub fn tools() -> Vec<ToolSpec> {
     Vec::from([
         ToolSpec {
             name: search(),
-            replay: ReplayPolicy::Redispatch,
+            safety: Safety::Idempotent,
+            timeout: Millis::new(10),
+            cancel_grace: Millis::ZERO,
         },
         ToolSpec {
             name: send_email(),
-            replay: ReplayPolicy::Interrupt,
+            safety: Safety::Unsafe,
+            timeout: Millis::new(10),
+            cancel_grace: Millis::new(5),
         },
     ])
 }
 
-/// Something the environment does. Each maps to one session input, except
-/// crashes and the passage of time.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum EnvAction {
-    /// Storage durably accepts the outstanding append.
-    AckAppend,
-    Respond {
-        effect: EffectId,
-        response: ModelResponse,
-    },
-    FailModel {
-        effect: EffectId,
-    },
-    ReturnTool {
-        effect: EffectId,
-        output: Json,
-        is_error: bool,
-    },
-    /// A dispatched effect honours a cancellation request.
-    ConfirmCancel {
-        effect: EffectId,
-    },
-    Submit {
-        request_id: RequestId,
-        text: String,
-    },
-    CancelTurn {
-        turn: TurnId,
-    },
-    /// The process dies and restarts from its durable log. The outstanding
-    /// append may or may not have reached storage.
-    Crash {
-        append_lands: bool,
-    },
-    Advance {
-        millis: u64,
-    },
+/// The model policy every preset gives its session.
+#[must_use]
+pub const fn model_policy() -> ModelPolicy {
+    ModelPolicy {
+        timeout: Millis::new(10),
+        retry: RetryPolicy {
+            max_attempts: 2,
+            initial_backoff: Millis::new(2),
+            max_backoff: Millis::new(8),
+        },
+    }
 }
 
-/// Everything outside the session.
+/// Something the environment does.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EnvAction {
+    /// The shell hands the session an input at the current time.
+    Deliver(Input),
+    /// Time reaches `at` and the shell ticks the session.
+    Tick { at: Timestamp },
+    /// The process dies and the session restarts from its durable log. The
+    /// outstanding append may or may not have reached storage. The shell
+    /// does the same when an append fails, since it cannot tell whether the
+    /// append landed.
+    Crash { append_lands: bool },
+    /// An append the shell gave up on reaches storage after all, unseen by
+    /// the session.
+    LateAppendLands,
+}
+
+/// An append storage has not answered.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Pending {
+    expected: Offset,
+    records: Vec<Record>,
+}
+
+/// Everything outside the session, including the truth about what effects
+/// really did, which survives crashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Env {
     now: Timestamp,
+    /// What storage holds.
     durable: Vec<Record>,
-    in_flight: Option<Vec<Record>>,
+    /// The log length the session last learned is durable.
+    acknowledged: Offset,
+    in_flight: Option<Pending>,
+    /// An append from an earlier life that may still land.
+    late: Option<Pending>,
+    late_landed: bool,
     dispatched: BTreeMap<EffectId, Effect>,
     cancel_requested: BTreeSet<EffectId>,
-    /// Tool calls with `ReplayPolicy::Interrupt` that were ever dispatched.
-    interrupt_dispatches: BTreeSet<EffectId>,
+    /// Effects the session dropped; a completion may still be on its way.
+    abandoned: BTreeMap<EffectId, Effect>,
+    /// Effects that were ever dispatched, in any life.
+    started: BTreeSet<EffectId>,
+    /// Tools that confirmed they stopped.
+    stopped: BTreeSet<EffectId>,
     submits: u8,
     cancels: u8,
     crashes: u8,
     tool_rounds: u8,
+    model_failures: u8,
     /// The first rule the session broke while talking to the environment.
     violation: Option<Violation>,
 }
@@ -157,39 +185,57 @@ pub struct World {
 }
 
 impl World {
-    /// A session whose log holds only its creation record.
+    /// A session whose log holds only its creation record, made at `now`.
+    #[must_use]
+    pub fn new(config: &WorldConfig, now: Timestamp) -> Self {
+        Self::start(config, now).0
+    }
+
+    /// Like [`World::new`], also returning the journal entry for the
+    /// session's start.
     ///
     /// # Panics
     ///
     /// Panics if the core rejects a freshly created log.
     #[must_use]
-    pub fn new(config: &WorldConfig) -> Self {
+    pub fn start(config: &WorldConfig, now: Timestamp) -> (Self, JournalEntry) {
         let created = Record {
             offset: Offset::ZERO,
-            at: Timestamp::EPOCH,
+            at: now,
             body: RecordBody::SessionCreated {
                 schema: SCHEMA_VERSION,
                 tools: config.tools.clone(),
+                model: config.model,
             },
         };
         let durable = Vec::from([created]);
-        let mut session =
-            Session::from_log(Timestamp::EPOCH, &durable).expect("a fresh log recovers");
+        let mut session = Session::from_log(now, &durable).expect("a fresh log recovers");
         let mut env = Env {
-            now: Timestamp::EPOCH,
+            now,
+            acknowledged: log_len(&durable),
             durable,
             in_flight: None,
+            late: None,
+            late_landed: false,
             dispatched: BTreeMap::new(),
             cancel_requested: BTreeSet::new(),
-            interrupt_dispatches: BTreeSet::new(),
+            abandoned: BTreeMap::new(),
+            started: BTreeSet::new(),
+            stopped: BTreeSet::new(),
             submits: 0,
             cancels: 0,
             crashes: 0,
             tool_rounds: 0,
+            model_failures: 0,
             violation: None,
         };
-        env.drain(&mut session);
-        Self { session, env }
+        let submissions = env.drain(&mut session);
+        let entry = JournalEntry::Recovered {
+            now,
+            log_len: env.acknowledged,
+            submissions,
+        };
+        (Self { session, env }, entry)
     }
 
     #[must_use]
@@ -201,22 +247,85 @@ impl World {
     pub const fn env(&self) -> &Env {
         &self.env
     }
+
+    /// Moves the environment's clock to `now`, unless it is already later.
+    pub fn advance_to(&mut self, now: Timestamp) {
+        self.env.now = self.env.now.max(now);
+    }
 }
 
 impl Env {
+    #[must_use]
+    pub const fn now(&self) -> Timestamp {
+        self.now
+    }
+
+    /// What storage holds, including appends the session has not learned of.
     #[must_use]
     pub fn durable(&self) -> &[Record] {
         &self.durable
     }
 
+    /// The log as the session knows it: acknowledged records, then the
+    /// outstanding append.
+    pub fn known(&self) -> impl Iterator<Item = &Record> {
+        let acknowledged = usize::try_from(self.acknowledged.get()).unwrap_or(usize::MAX);
+        self.durable
+            .iter()
+            .take(acknowledged)
+            .chain(self.in_flight.iter().flat_map(|pending| &pending.records))
+    }
+
     #[must_use]
-    pub fn in_flight(&self) -> &[Record] {
-        self.in_flight.as_deref().unwrap_or_default()
+    pub const fn in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// Whether `effect` was dispatched in any life of the session.
+    #[must_use]
+    pub fn started(&self, effect: EffectId) -> bool {
+        self.started.contains(&effect)
+    }
+
+    /// Whether `effect` confirmed it stopped.
+    #[must_use]
+    pub fn stopped(&self, effect: EffectId) -> bool {
+        self.stopped.contains(&effect)
+    }
+
+    /// Whether some tool ever confirmed it stopped.
+    #[must_use]
+    pub fn any_stopped(&self) -> bool {
+        !self.stopped.is_empty()
+    }
+
+    #[must_use]
+    pub const fn late_landed(&self) -> bool {
+        self.late_landed
     }
 
     #[must_use]
     pub const fn violation(&self) -> Option<&Violation> {
         self.violation.as_ref()
+    }
+
+    /// Whether storage durably holds the admission of `request_id`.
+    fn admitted(&self, request_id: &RequestId) -> bool {
+        self.durable.iter().any(|record| {
+            matches!(&record.body, RecordBody::InputAdmitted { request_id: admitted, .. } if admitted == request_id)
+        })
+    }
+
+    fn tail(&self) -> Offset {
+        log_len(&self.durable)
+    }
+
+    /// Whether the outstanding append can still land: storage only accepts
+    /// it at the offset it expects.
+    fn append_can_land(&self) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|pending| pending.expected == self.tail())
     }
 
     /// Collects the session's submissions, enforcing the rules the shell
@@ -238,41 +347,44 @@ impl Env {
                 if self.in_flight.is_some() {
                     return Err(Violation::ConcurrentAppend);
                 }
-                let tail = log_len(&self.durable);
-                if *expected != tail {
+                if *expected != self.acknowledged {
                     return Err(Violation::AppendNotAtTail {
                         expected: *expected,
-                        tail,
+                        tail: self.acknowledged,
                     });
                 }
-                self.in_flight = Some(records.clone());
+                self.in_flight = Some(Pending {
+                    expected: *expected,
+                    records: records.clone(),
+                });
             }
             Submission::Dispatch { effect } => {
                 let id = effect.id();
-                let intent = usize::try_from(id.intent().get())
-                    .ok()
+                let intent = (id.intent() < self.acknowledged)
+                    .then(|| usize::try_from(id.intent().get()).ok())
+                    .flatten()
                     .and_then(|index| self.durable.get(index))
                     .ok_or(Violation::DispatchBeforeDurable(id))?;
-                let replay = match (&intent.body, effect) {
+                let safety = match (&intent.body, effect) {
                     (
                         RecordBody::ModelIntent { request, .. },
                         Effect::CallModel {
                             request: dispatched,
                             ..
                         },
-                    ) if request == dispatched => ReplayPolicy::Redispatch,
+                    ) if request == dispatched => Safety::Idempotent,
                     (
-                        RecordBody::ToolIntent { call, replay, .. },
+                        RecordBody::ToolIntent { call, safety, .. },
                         Effect::RunTool {
                             call: dispatched, ..
                         },
-                    ) if call == dispatched => *replay,
+                    ) if call == dispatched => *safety,
                     _ => return Err(Violation::DispatchMismatch(id)),
                 };
                 if self.dispatched.insert(id, effect.clone()).is_some() {
                     return Err(Violation::DoubleDispatch(id));
                 }
-                if replay == ReplayPolicy::Interrupt && !self.interrupt_dispatches.insert(id) {
+                if !self.started.insert(id) && safety == Safety::Unsafe {
                     return Err(Violation::UnsafeRedispatch(id));
                 }
             }
@@ -282,157 +394,223 @@ impl Env {
                 }
                 self.cancel_requested.insert(*effect);
             }
+            Submission::Abandon { effect } => {
+                let dropped = self
+                    .dispatched
+                    .remove(effect)
+                    .ok_or(Violation::AbandonUndispatched(*effect))?;
+                self.abandoned.insert(*effect, dropped);
+            }
         }
         Ok(())
     }
 
-    /// Removes a dispatched effect the environment is about to complete.
-    fn complete(&mut self, effect: EffectId) {
+    /// Forgets an effect whose completion the shell is delivering.
+    fn finish(&mut self, effect: EffectId) {
         self.dispatched.remove(&effect);
+        self.abandoned.remove(&effect);
         self.cancel_requested.remove(&effect);
+    }
+
+    /// The effect a completion for `effect` would answer, if the shell could
+    /// deliver one: it is running, or was abandoned after it finished.
+    fn deliverable(&self, effect: EffectId) -> Option<&Effect> {
+        self.dispatched
+            .get(&effect)
+            .or_else(|| self.abandoned.get(&effect))
     }
 }
 
-/// What the environment may do next, in a deterministic order.
+/// What the generator explores next, in a deterministic order.
 #[must_use]
 pub fn enabled(config: &WorldConfig, world: &World) -> Vec<EnvAction> {
     let env = &world.env;
     let mut actions = Vec::new();
-    if env.in_flight.is_some() {
-        actions.push(EnvAction::AckAppend);
+    if let Some(pending) = env.in_flight.as_ref().filter(|_| env.append_can_land()) {
+        actions.push(EnvAction::Deliver(Input::Appended {
+            end: end_of(pending),
+        }));
     }
     for (id, effect) in &env.dispatched {
         match effect {
             Effect::CallModel { .. } => {
-                actions.push(EnvAction::Respond {
-                    effect: *id,
-                    response: ModelResponse {
-                        content: Vec::from([ContentBlock::Text {
-                            text: "done".to_owned(),
-                        }]),
-                    },
-                });
-                actions.push(EnvAction::FailModel { effect: *id });
+                actions.push(EnvAction::Deliver(respond(*id, done())));
+                if env.model_failures < config.model_failures {
+                    for retryable in [true, false] {
+                        actions.push(EnvAction::Deliver(Input::ModelFailed {
+                            effect: *id,
+                            reason: "provider error".to_owned(),
+                            retryable,
+                            retry_after: None,
+                        }));
+                    }
+                }
                 if env.tool_rounds < config.tool_rounds {
                     for names in &config.tool_replies {
-                        actions.push(EnvAction::Respond {
-                            effect: *id,
-                            response: tool_reply(*id, names),
-                        });
+                        actions.push(EnvAction::Deliver(respond(*id, tool_reply(*id, names))));
                     }
                     if config.invalid_replies
                         && let Some(names) = config.tool_replies.first()
                     {
                         let mut reply = tool_reply(*id, names);
                         reply.content.extend(reply.content.clone());
-                        actions.push(EnvAction::Respond {
-                            effect: *id,
-                            response: reply,
-                        });
+                        actions.push(EnvAction::Deliver(respond(*id, reply)));
                     }
                 }
             }
-            Effect::RunTool { .. } => actions.push(EnvAction::ReturnTool {
-                effect: *id,
-                output: Json::string("ok"),
-                is_error: false,
-            }),
+            Effect::RunTool { .. } => actions.push(EnvAction::Deliver(tool_ok(*id))),
         }
         if env.cancel_requested.contains(id) {
-            actions.push(EnvAction::ConfirmCancel { effect: *id });
+            actions.push(EnvAction::Deliver(Input::EffectCancelled { effect: *id }));
+        }
+    }
+    if config.late_completions {
+        for (id, effect) in &env.abandoned {
+            actions.push(EnvAction::Deliver(match effect {
+                Effect::CallModel { .. } => respond(*id, done()),
+                Effect::RunTool { .. } => tool_ok(*id),
+            }));
         }
     }
     if env.submits < config.submits {
-        actions.push(EnvAction::Submit {
-            request_id: request_id(env.submits),
-            text: "hello".to_owned(),
-        });
+        actions.push(EnvAction::Deliver(submit(env.submits)));
         if env.submits > 0 {
-            actions.push(EnvAction::Submit {
-                request_id: request_id(0),
-                text: "hello".to_owned(),
-            });
+            actions.push(EnvAction::Deliver(submit(0)));
+        }
+    }
+    // Clients resubmit until they see their input admitted in the durable
+    // log, so a crash cannot lose a request for good.
+    for index in 0..env.submits {
+        if !env.admitted(&request_id(index)) {
+            actions.push(EnvAction::Deliver(submit(index)));
         }
     }
     if env.cancels < config.cancels
         && let Some(turn) = world.session.active_turn()
     {
-        actions.push(EnvAction::CancelTurn { turn });
+        actions.push(EnvAction::Deliver(Input::CancelTurn { turn }));
     }
     if env.crashes < config.crashes {
-        if env.in_flight.is_some() {
+        if env.append_can_land() {
             actions.push(EnvAction::Crash { append_lands: true });
         }
         actions.push(EnvAction::Crash {
             append_lands: false,
         });
+    } else if env.in_flight.is_some() && !env.append_can_land() {
+        // Storage rejects the append; the shell recovers whatever the budget.
+        actions.push(EnvAction::Crash {
+            append_lands: false,
+        });
     }
-    if config.advance_time {
-        actions.push(EnvAction::Advance { millis: 1 });
+    if config.late_appends
+        && env
+            .late
+            .as_ref()
+            .is_some_and(|late| late.expected == env.tail())
+    {
+        actions.push(EnvAction::LateAppendLands);
+    }
+    if let Some(at) = world.session.deadline() {
+        actions.push(EnvAction::Tick { at });
     }
     actions
 }
 
-/// Does `action` to the world and returns what the session submitted in
-/// response.
-pub fn step(world: &mut World, action: EnvAction) -> Vec<Submission> {
+/// Whether a shell could do `action` now, whatever its payload. This is the
+/// contract real shells are held to; [`enabled`] explores a finite part of
+/// it.
+#[must_use]
+pub fn admits(world: &World, action: &EnvAction) -> bool {
+    let env = &world.env;
+    let is_model = |effect: &EffectId| {
+        env.deliverable(*effect)
+            .is_some_and(|effect| matches!(effect, Effect::CallModel { .. }))
+    };
+    let is_tool = |effect: &EffectId| {
+        env.deliverable(*effect)
+            .is_some_and(|effect| matches!(effect, Effect::RunTool { .. }))
+    };
+    match action {
+        EnvAction::Deliver(input) => match input {
+            Input::Appended { end } => {
+                env.append_can_land() && env.in_flight.as_ref().map(end_of) == Some(*end)
+            }
+            Input::ModelResponded { effect, .. } | Input::ModelFailed { effect, .. } => {
+                is_model(effect)
+            }
+            Input::ToolReturned { effect, .. } => is_tool(effect),
+            Input::EffectCancelled { effect } => env.cancel_requested.contains(effect),
+            Input::Submit { .. } | Input::CancelTurn { .. } | Input::Tick => true,
+        },
+        EnvAction::Tick { .. }
+        | EnvAction::Crash {
+            append_lands: false,
+        } => true,
+        EnvAction::Crash { append_lands: true } => env.append_can_land(),
+        EnvAction::LateAppendLands => env
+            .late
+            .as_ref()
+            .is_some_and(|late| late.expected == env.tail()),
+    }
+}
+
+/// Does `action` to the world and returns the journal entry a shell would
+/// write for it, if any: storage acting on its own is invisible to the
+/// session.
+pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
     let env = &mut world.env;
     let input = match action {
-        EnvAction::AckAppend => {
-            if let Some(records) = env.in_flight.take() {
-                env.durable.extend(records);
+        EnvAction::Deliver(input) => {
+            match &input {
+                Input::Appended { .. } => {
+                    if let Some(pending) = env.in_flight.take() {
+                        env.durable.extend(pending.records);
+                    }
+                    env.acknowledged = env.tail();
+                }
+                Input::ModelResponded { effect, response } => {
+                    env.finish(*effect);
+                    if !response.tool_calls().is_empty() {
+                        env.tool_rounds = env.tool_rounds.saturating_add(1);
+                    }
+                }
+                Input::ModelFailed { effect, .. } => {
+                    env.finish(*effect);
+                    env.model_failures = env.model_failures.saturating_add(1);
+                }
+                Input::ToolReturned { effect, .. } => env.finish(*effect),
+                Input::EffectCancelled { effect } => {
+                    env.finish(*effect);
+                    env.stopped.insert(*effect);
+                }
+                Input::Submit { request_id, .. } => {
+                    if *request_id == self::request_id(env.submits) {
+                        env.submits = env.submits.saturating_add(1);
+                    }
+                }
+                Input::CancelTurn { .. } => env.cancels = env.cancels.saturating_add(1),
+                Input::Tick => {}
             }
-            Input::Appended {
-                end: log_len(&env.durable),
-            }
+            input
         }
-        EnvAction::Respond { effect, response } => {
-            env.complete(effect);
-            if !response.tool_calls().is_empty() {
-                env.tool_rounds = env.tool_rounds.saturating_add(1);
-            }
-            Input::ModelResponded { effect, response }
-        }
-        EnvAction::FailModel { effect } => {
-            env.complete(effect);
-            Input::ModelFailed {
-                effect,
-                reason: "provider error".to_owned(),
-            }
-        }
-        EnvAction::ReturnTool {
-            effect,
-            output,
-            is_error,
-        } => {
-            env.complete(effect);
-            Input::ToolReturned {
-                effect,
-                output,
-                is_error,
-            }
-        }
-        EnvAction::ConfirmCancel { effect } => {
-            env.complete(effect);
-            Input::EffectCancelled { effect }
-        }
-        EnvAction::Submit { request_id, text } => {
-            env.submits = env.submits.saturating_add(1);
-            Input::Submit { request_id, text }
-        }
-        EnvAction::CancelTurn { turn } => {
-            env.cancels = env.cancels.saturating_add(1);
-            Input::CancelTurn { turn }
+        EnvAction::Tick { at } => {
+            env.now = env.now.max(at);
+            Input::Tick
         }
         EnvAction::Crash { append_lands } => {
             env.crashes = env.crashes.saturating_add(1);
-            if let Some(records) = env.in_flight.take()
-                && append_lands
-            {
-                env.durable.extend(records);
+            if let Some(pending) = env.in_flight.take() {
+                if append_lands && pending.expected == env.tail() {
+                    env.durable.extend(pending.records);
+                } else if pending.expected == env.tail() {
+                    env.late = Some(pending);
+                }
             }
             env.dispatched.clear();
             env.cancel_requested.clear();
+            env.abandoned.clear();
+            env.acknowledged = env.tail();
             match Session::from_log(env.now, &env.durable) {
                 Ok(session) => world.session = session,
                 Err(error) => {
@@ -440,15 +618,73 @@ pub fn step(world: &mut World, action: EnvAction) -> Vec<Submission> {
                         .get_or_insert(Violation::Unrecoverable(error.to_string()));
                 }
             }
-            return env.drain(&mut world.session);
+            let submissions = env.drain(&mut world.session);
+            return Some(JournalEntry::Recovered {
+                now: env.now,
+                log_len: env.acknowledged,
+                submissions,
+            });
         }
-        EnvAction::Advance { millis } => {
-            env.now = Timestamp::from_millis(env.now.millis().saturating_add(millis));
-            return Vec::new();
+        EnvAction::LateAppendLands => {
+            if let Some(late) = env.late.take()
+                && late.expected == env.tail()
+            {
+                env.durable.extend(late.records);
+                env.late_landed = true;
+            }
+            return None;
         }
     };
-    world.session.handle(env.now, input);
-    env.drain(&mut world.session)
+    world.session.handle(env.now, input.clone());
+    let submissions = env.drain(&mut world.session);
+    Some(JournalEntry::Handled {
+        now: env.now,
+        input,
+        submissions,
+    })
+}
+
+/// The actions that explain a session restarting from a log of `log_len`
+/// records: the outstanding append landed, a late append landed first, or
+/// nothing landed.
+#[must_use]
+pub fn recovery(world: &World, log_len: Offset) -> Option<Vec<EnvAction>> {
+    let env = &world.env;
+    let tail = env.tail();
+    let lands = |pending: &Pending| {
+        pending.expected == tail
+            && u64::try_from(pending.records.len())
+                .ok()
+                .and_then(|added| tail.get().checked_add(added))
+                == Some(log_len.get())
+    };
+    if env.in_flight.as_ref().is_some_and(lands) {
+        Some(Vec::from([EnvAction::Crash { append_lands: true }]))
+    } else if env.late.as_ref().is_some_and(lands) {
+        Some(Vec::from([
+            EnvAction::LateAppendLands,
+            EnvAction::Crash {
+                append_lands: false,
+            },
+        ]))
+    } else if log_len == tail {
+        Some(Vec::from([EnvAction::Crash {
+            append_lands: false,
+        }]))
+    } else {
+        None
+    }
+}
+
+fn end_of(pending: &Pending) -> Offset {
+    let added = u64::try_from(pending.records.len()).expect("an append's length fits in u64");
+    Offset::new(
+        pending
+            .expected
+            .get()
+            .checked_add(added)
+            .expect("a log length fits in u64"),
+    )
 }
 
 fn log_len(records: &[Record]) -> Offset {
@@ -457,6 +693,33 @@ fn log_len(records: &[Record]) -> Offset {
 
 fn request_id(index: u8) -> RequestId {
     RequestId::new(format!("request-{index}"))
+}
+
+fn submit(index: u8) -> Input {
+    Input::Submit {
+        request_id: request_id(index),
+        text: "hello".to_owned(),
+    }
+}
+
+const fn respond(effect: EffectId, response: ModelResponse) -> Input {
+    Input::ModelResponded { effect, response }
+}
+
+fn done() -> ModelResponse {
+    ModelResponse {
+        content: Vec::from([ContentBlock::Text {
+            text: "done".to_owned(),
+        }]),
+    }
+}
+
+fn tool_ok(effect: EffectId) -> Input {
+    Input::ToolReturned {
+        effect,
+        output: Json::string("ok"),
+        is_error: false,
+    }
 }
 
 fn tool_reply(effect: EffectId, names: &[ToolName]) -> ModelResponse {

@@ -3,9 +3,10 @@
 //! edit a fixture; a new schema version gets a new one.
 
 use piton_domain::{
-    ContentBlock, EffectId, Json, Message, ModelOutcome, ModelRequest, ModelResponse, Offset,
-    Record, RecordBody, ReplayPolicy, RequestId, Role, SCHEMA_VERSION, Timestamp, ToolCall,
-    ToolName, ToolOutcome, ToolSpec, ToolUseId, TurnEnd, TurnId,
+    ContentBlock, EffectId, Json, Message, Millis, ModelOutcome, ModelPolicy, ModelRequest,
+    ModelResponse, Offset, Record, RecordBody, RequestId, RetryPolicy, Role, SCHEMA_VERSION,
+    Safety, StopReason, Timestamp, ToolCall, ToolName, ToolOutcome, ToolSpec, ToolUseId, TurnEnd,
+    TurnId, UnknownCause,
 };
 
 const SCHEMA_1: &str = include_str!("fixtures/schema-1.ndjson");
@@ -20,17 +21,36 @@ fn tool_call() -> ToolCall {
 
 /// One record of every kind, and every outcome variant.
 fn schema_1_records() -> Vec<Record> {
-    let turn = TurnId::new(Offset::new(2));
-    let model_call = EffectId::new(Offset::new(3));
-    let tool = EffectId::new(Offset::new(5));
+    let turn = TurnId::new(Offset::new(3));
+    let model_call = EffectId::new(Offset::new(4));
+    let tool = EffectId::new(Offset::new(6));
     let bodies = [
         RecordBody::SessionCreated {
             schema: SCHEMA_VERSION,
-            tools: Vec::from([ToolSpec {
-                name: ToolName::new("search".to_owned()),
-                replay: ReplayPolicy::Redispatch,
-            }]),
+            tools: Vec::from([
+                ToolSpec {
+                    name: ToolName::new("search".to_owned()),
+                    safety: Safety::Idempotent,
+                    timeout: Millis::new(30_000),
+                    cancel_grace: Millis::ZERO,
+                },
+                ToolSpec {
+                    name: ToolName::new("send_email".to_owned()),
+                    safety: Safety::Unsafe,
+                    timeout: Millis::new(60_000),
+                    cancel_grace: Millis::new(5_000),
+                },
+            ]),
+            model: ModelPolicy {
+                timeout: Millis::new(120_000),
+                retry: RetryPolicy {
+                    max_attempts: 3,
+                    initial_backoff: Millis::new(1_000),
+                    max_backoff: Millis::new(30_000),
+                },
+            },
         },
+        RecordBody::SessionResumed,
         RecordBody::InputAdmitted {
             request_id: RequestId::new("request-1".to_owned()),
             text: "find piton".to_owned(),
@@ -64,7 +84,7 @@ fn schema_1_records() -> Vec<Record> {
         RecordBody::ToolIntent {
             turn,
             call: tool_call(),
-            replay: ReplayPolicy::Interrupt,
+            safety: Safety::Unsafe,
         },
         RecordBody::ToolResolved {
             effect: tool,
@@ -75,11 +95,27 @@ fn schema_1_records() -> Vec<Record> {
         },
         RecordBody::ToolResolved {
             effect: tool,
-            outcome: ToolOutcome::Cancelled,
+            outcome: ToolOutcome::NotRun {
+                reason: StopReason::TurnCancelled,
+            },
         },
         RecordBody::ToolResolved {
             effect: tool,
-            outcome: ToolOutcome::Interrupted,
+            outcome: ToolOutcome::Stopped {
+                reason: StopReason::TimedOut,
+            },
+        },
+        RecordBody::ToolResolved {
+            effect: tool,
+            outcome: ToolOutcome::Unknown {
+                cause: UnknownCause::Restart,
+            },
+        },
+        RecordBody::ToolResolved {
+            effect: tool,
+            outcome: ToolOutcome::Unknown {
+                cause: UnknownCause::Abandoned,
+            },
         },
         RecordBody::ToolResolved {
             effect: tool,
@@ -89,6 +125,16 @@ fn schema_1_records() -> Vec<Record> {
             effect: model_call,
             outcome: ModelOutcome::Failed {
                 reason: "overloaded".to_owned(),
+                retryable: true,
+                retry_after: Some(Millis::new(2_000)),
+            },
+        },
+        RecordBody::ModelResolved {
+            effect: model_call,
+            outcome: ModelOutcome::Failed {
+                reason: "invalid request".to_owned(),
+                retryable: false,
+                retry_after: None,
             },
         },
         RecordBody::ModelResolved {
@@ -172,4 +218,17 @@ fn write_schema_1_fixture() {
         "/tests/fixtures/schema-1.ndjson"
     );
     std::fs::write(path, to_ndjson(&schema_1_records())).expect("the fixture is writable");
+}
+
+#[test]
+fn backoff_doubles_up_to_its_cap() {
+    let retry = RetryPolicy {
+        max_attempts: 6,
+        initial_backoff: Millis::new(100),
+        max_backoff: Millis::new(500),
+    };
+    let waits: Vec<u64> = (1..=5)
+        .map(|failures| retry.backoff(failures).get())
+        .collect();
+    assert_eq!(waits, [100, 200, 400, 500, 500], "doubling, then capped");
 }

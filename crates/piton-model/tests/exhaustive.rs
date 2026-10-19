@@ -15,7 +15,7 @@ fn every_reachable_state_keeps_the_invariants() {
         .join();
     checker.assert_properties();
     assert!(
-        checker.unique_state_count() > 100_000,
+        checker.unique_state_count() > 1_000_000,
         "bounds too small to mean much: {} states",
         checker.unique_state_count()
     );

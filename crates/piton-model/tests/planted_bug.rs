@@ -4,6 +4,7 @@
 
 #![cfg(piton_planted_bug)]
 
+use piton_domain::Timestamp;
 use piton_model::{Checked, DivergenceReason, Violation, World, WorldConfig, check, step, walk};
 use proptest::{
     collection::vec,
@@ -25,17 +26,14 @@ fn stateright_finds_the_planted_bug() {
     // Stateright 0.31 lets later discoveries overwrite earlier ones, so the
     // path is a counterexample but not necessarily a shortest one. Replay it
     // to find the first step that breaks.
-    let config = WorldConfig::exhaustive();
-    let mut world = World::new(&config);
+    let mut world = World::new(&WorldConfig::exhaustive(), Timestamp::EPOCH);
     let first_break = counterexample
         .into_actions()
         .into_iter()
         .enumerate()
         .find_map(|(index, action)| {
             step(&mut world, action);
-            check(&config, &world)
-                .err()
-                .map(|violation| (index, violation))
+            check(&world).err().map(|violation| (index, violation))
         });
     assert!(
         matches!(first_break, Some((0, Violation::DispatchBeforeDurable(_)))),
@@ -60,10 +58,11 @@ fn proptest_finds_and_shrinks_the_planted_bug() {
     let Err(TestError::Fail(_, minimal)) = outcome else {
         panic!("proptest missed the planted bug: {outcome:?}");
     };
-    let Err((steps, divergence)) = walk(&WorldConfig::deep(), &minimal) else {
+    let Err((entries, divergence)) = walk(&WorldConfig::deep(), &minimal) else {
         panic!("the shrunk input no longer fails");
     };
-    assert!(steps.len() <= 3, "shrunk to {} steps", steps.len());
+    // The creation entry, then the submit that dispatches too early.
+    assert!(entries.len() <= 2, "shrunk to {} entries", entries.len());
     assert!(
         matches!(
             divergence.reason,

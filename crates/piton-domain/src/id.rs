@@ -80,6 +80,36 @@ impl Timestamp {
     pub const fn millis(self) -> u64 {
         self.0
     }
+
+    /// The instant `duration` after this one, saturating at the far future.
+    #[must_use]
+    pub const fn after(self, duration: Millis) -> Self {
+        Self(self.0.saturating_add(duration.0))
+    }
+
+    /// Time from `earlier` to this instant, or zero if `earlier` is later.
+    #[must_use]
+    pub const fn since(self, earlier: Self) -> Millis {
+        Millis(self.0.saturating_sub(earlier.0))
+    }
+}
+
+/// A span of time in milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Millis(u64);
+
+impl Millis {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(millis: u64) -> Self {
+        Self(millis)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 macro_rules! string_id {
@@ -100,6 +130,11 @@ macro_rules! string_id {
             }
         }
     };
+}
+
+string_id! {
+    /// Names a session; each session has its own log.
+    SessionId
 }
 
 string_id! {
