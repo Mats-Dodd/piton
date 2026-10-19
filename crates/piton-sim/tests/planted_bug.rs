@@ -1,7 +1,7 @@
 //! Proof the simulator can fail. Built only with
 //! `--cfg piton_planted_shell_bug`, which makes the runtime leave abandoned
-//! tools running (`just planted-bug`). Only the faults and the ports' ground
-//! truth expose it: the journal alone looks fine.
+//! tools running (`just planted-bug`). Only faults that make the session
+//! abandon tools expose it.
 
 #![cfg(all(tokio_unstable, piton_planted_shell_bug))]
 
@@ -14,7 +14,10 @@ fn the_simulator_finds_the_planted_bug() {
         check(&run).err().map(|failure| (seed, failure))
     });
     assert!(
-        matches!(found, Some((_, Failure::Untruthful(_)))),
+        matches!(
+            found,
+            Some((_, Failure::Untruthful(_) | Failure::Diverged(_)))
+        ),
         "the simulator missed a runtime that leaves abandoned tools running: {found:?}"
     );
 }

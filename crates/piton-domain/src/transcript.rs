@@ -1,4 +1,8 @@
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec::Vec,
+};
 
 use crate::{
     ContentBlock, EffectId, Message, ModelOutcome, ModelRequest, Record, RecordBody, RequestId,
@@ -14,6 +18,8 @@ pub struct Transcript {
     queued: BTreeMap<RequestId, String>,
     /// Tool uses still waiting for their result.
     awaiting: BTreeMap<EffectId, ToolUseId>,
+    /// Every tool use id the conversation has used.
+    tool_uses: BTreeSet<ToolUseId>,
 }
 
 impl Transcript {
@@ -44,6 +50,9 @@ impl Transcript {
                 ..
             } => {
                 for block in &response.content {
+                    if let ContentBlock::ToolUse { id, .. } = block {
+                        self.tool_uses.insert(id.clone());
+                    }
                     self.push(Role::Assistant, block.clone());
                 }
             }
@@ -76,6 +85,12 @@ impl Transcript {
     #[must_use]
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Whether the conversation has already used tool use id `id`.
+    #[must_use]
+    pub fn has_tool_use(&self, id: &ToolUseId) -> bool {
+        self.tool_uses.contains(id)
     }
 
     /// The request for the next model call.

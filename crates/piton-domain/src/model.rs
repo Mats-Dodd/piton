@@ -13,8 +13,9 @@ pub struct ModelRequest {
 
 impl ModelRequest {
     /// Checks the shape providers require: the conversation starts and ends
-    /// with the user, roles alternate, and every tool use is answered by
-    /// exactly one result in the very next message.
+    /// with the user, roles alternate, every tool use has an id used nowhere
+    /// else in the conversation, and every tool use is answered by exactly
+    /// one result in the very next message.
     ///
     /// # Errors
     ///
@@ -29,6 +30,7 @@ impl ModelRequest {
             return Err(MalformedRequest::EndsWithAssistant);
         }
         let mut unanswered = BTreeSet::new();
+        let mut used = BTreeSet::new();
         let mut previous_role = None;
         for message in &self.messages {
             if previous_role == Some(message.role) {
@@ -40,9 +42,10 @@ impl ModelRequest {
                     for block in &message.content {
                         match block {
                             ContentBlock::ToolUse { id, .. } => {
-                                if !unanswered.insert(id.clone()) {
+                                if !used.insert(id) {
                                     return Err(MalformedRequest::DuplicateToolUse(id.clone()));
                                 }
+                                unanswered.insert(id.clone());
                             }
                             ContentBlock::ToolResult { tool_use_id, .. } => {
                                 return Err(MalformedRequest::ResultFromAssistant(
@@ -224,6 +227,51 @@ pub struct ModelPolicy {
     pub timeout: Millis,
     pub retry: RetryPolicy,
 }
+
+impl ModelPolicy {
+    /// Checks the policy can be followed: calls take time to fail, every
+    /// call gets at least one attempt, and backoff grows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the policy breaks.
+    pub fn validate(&self) -> Result<(), InvalidPolicy> {
+        if self.timeout == Millis::ZERO {
+            return Err(InvalidPolicy::ZeroModelTimeout);
+        }
+        if self.retry.max_attempts == 0 {
+            return Err(InvalidPolicy::NoAttempts);
+        }
+        if self.retry.max_backoff < self.retry.initial_backoff {
+            return Err(InvalidPolicy::BackoffCapBelowStart);
+        }
+        Ok(())
+    }
+}
+
+/// Why a session's policy cannot be followed. A zero timeout, for one,
+/// would let a single input fail and retry a call any number of times
+/// without time passing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InvalidPolicy {
+    ZeroModelTimeout,
+    ZeroToolTimeout,
+    NoAttempts,
+    BackoffCapBelowStart,
+}
+
+impl fmt::Display for InvalidPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ZeroModelTimeout => "model calls need a timeout above zero",
+            Self::ZeroToolTimeout => "tools need a timeout above zero",
+            Self::NoAttempts => "model calls need at least one attempt",
+            Self::BackoffCapBelowStart => "the backoff cap is below the initial backoff",
+        })
+    }
+}
+
+impl core::error::Error for InvalidPolicy {}
 
 /// Exponential backoff between attempts at one model call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

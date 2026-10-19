@@ -25,8 +25,8 @@ pub use id::{
 };
 pub use json::{InvalidJson, Json};
 pub use model::{
-    InvalidResponse, MalformedRequest, ModelOutcome, ModelPolicy, ModelRequest, ModelResponse,
-    RetryPolicy,
+    InvalidPolicy, InvalidResponse, MalformedRequest, ModelOutcome, ModelPolicy, ModelRequest,
+    ModelResponse, RetryPolicy,
 };
 pub use record::{Record, RecordBody, SCHEMA_VERSION, TurnEnd};
 pub use tool::{Safety, StopReason, ToolCall, ToolOutcome, ToolSpec, UnknownCause};

@@ -110,33 +110,48 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 /// Fires when the session asks a running tool to stop.
+///
+/// It also fires when the session stops waiting for the tool: when it
+/// abandons it, recovers or shuts down. Work a tool hands off and that
+/// outlives its call should watch it.
 #[derive(Clone, Debug)]
-pub struct CancelSignal(watch::Receiver<bool>);
+pub struct CancelSignal(Option<watch::Receiver<bool>>);
 
 impl CancelSignal {
-    /// A signal and the switch that fires it.
+    /// A signal and the switch that fires it, explicitly or by being
+    /// dropped.
     pub(crate) fn new() -> (watch::Sender<bool>, Self) {
         let (switch, signal) = watch::channel(false);
-        (switch, Self(signal))
+        (switch, Self(Some(signal)))
     }
 
     /// A signal that never fires, for running a tool outside a session.
     #[must_use]
-    pub fn never() -> Self {
-        Self::new().1
+    pub const fn never() -> Self {
+        Self(None)
     }
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        *self.0.borrow()
+        self.0
+            .as_ref()
+            .is_some_and(|signal| *signal.borrow() || signal.has_changed().is_err())
     }
 
-    /// Completes once the session asks the tool to stop; never, if it
-    /// doesn't.
+    /// Completes once the tool should stop; never, for a signal from
+    /// [`CancelSignal::never`].
     pub async fn cancelled(&self) {
-        let mut signal = self.0.clone();
-        if signal.wait_for(|cancelled| *cancelled).await.is_err() {
-            std::future::pending::<()>().await;
+        match &self.0 {
+            Some(signal) => {
+                // Fired, or the switch is gone: either way, stop.
+                signal
+                    .clone()
+                    .wait_for(|cancelled| *cancelled)
+                    .await
+                    .map(|_| ())
+                    .unwrap_or_default();
+            }
+            None => std::future::pending().await,
         }
     }
 }

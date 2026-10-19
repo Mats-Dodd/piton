@@ -38,30 +38,48 @@ impl Runtime {
 
     /// Creates a session with `tools` and `model` policy and starts it.
     ///
+    /// Safe to retry: if the session already exists exactly as asked, as
+    /// when an earlier attempt's reply was lost, it is opened.
+    ///
     /// # Errors
     ///
-    /// Fails if the session's log cannot be created, for instance because
-    /// it already exists, or then cannot be read back.
+    /// Fails with [`OpenError::InvalidPolicy`] if the policy cannot be
+    /// followed, [`OpenError::AlreadyExists`] if a different session has
+    /// this id, or if its log cannot be written or read back.
     pub async fn create(
         &self,
         id: SessionId,
         tools: Vec<ToolSpec>,
         model: ModelPolicy,
     ) -> Result<SessionHandle, OpenError> {
+        model.validate().map_err(OpenError::InvalidPolicy)?;
+        for spec in &tools {
+            spec.validate().map_err(OpenError::InvalidPolicy)?;
+        }
+        let body = RecordBody::SessionCreated {
+            schema: SCHEMA_VERSION,
+            tools,
+            model,
+        };
         let created = Record {
             offset: Offset::ZERO,
             at: self.ports.clock.now(),
-            body: RecordBody::SessionCreated {
-                schema: SCHEMA_VERSION,
-                tools,
-                model,
-            },
+            body: body.clone(),
         };
-        self.ports
-            .store
-            .append(&id, Offset::ZERO, Vec::from([created]))
-            .await
-            .map_err(OpenError::Store)?;
+        let store = &self.ports.store;
+        if let Err(failed) = store.append(&id, Offset::ZERO, Vec::from([created])).await {
+            // The append may have landed, or the session may already exist.
+            let existing = store
+                .read(&id, Offset::ZERO)
+                .await
+                .ok()
+                .and_then(|records| records.into_iter().next());
+            match existing {
+                Some(first) if first.body == body => {}
+                Some(_) => return Err(OpenError::AlreadyExists),
+                None => return Err(OpenError::Store(failed)),
+            }
+        }
         self.open(id).await
     }
 
@@ -75,7 +93,7 @@ impl Runtime {
     /// Fails if the log cannot be read or is not a well-formed session log.
     pub async fn open(&self, id: SessionId) -> Result<SessionHandle, OpenError> {
         let (sender, events) = mpsc::channel(QUEUE_CAPACITY);
-        let pump = Pump::open(id.clone(), self.ports.clone(), events, sender.clone()).await?;
+        let pump = Pump::open(id.clone(), self.ports.clone(), events, &sender).await?;
         let durable = pump.durable();
         tokio::spawn(pump.run());
         Ok(SessionHandle {

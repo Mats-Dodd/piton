@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Json, Millis, ToolName, ToolUseId};
+use crate::{InvalidPolicy, Json, Millis, ToolName, ToolUseId};
 
 /// Whether running a tool twice, or only partly, matters. Decides both what
 /// recovery does with a tool that was in flight at a restart and what
@@ -27,6 +27,21 @@ pub struct ToolSpec {
     /// How long an unsafe tool has to confirm it stopped before the session
     /// abandons it.
     pub cancel_grace: Millis,
+}
+
+impl ToolSpec {
+    /// Checks the tool can be run under the session's rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPolicy::ZeroToolTimeout`] for a zero timeout.
+    pub fn validate(&self) -> Result<(), InvalidPolicy> {
+        if self.timeout == Millis::ZERO {
+            Err(InvalidPolicy::ZeroToolTimeout)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A tool use the model asked for.

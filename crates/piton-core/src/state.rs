@@ -2,8 +2,9 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::fmt;
 
 use piton_domain::{
-    EffectId, Millis, ModelOutcome, ModelPolicy, Offset, Record, RecordBody, RequestId,
-    SCHEMA_VERSION, Safety, Timestamp, ToolCall, ToolName, ToolSpec, Transcript, TurnEnd, TurnId,
+    EffectId, InvalidPolicy, Millis, ModelOutcome, ModelPolicy, Offset, Record, RecordBody,
+    RequestId, SCHEMA_VERSION, Safety, Timestamp, ToolCall, ToolName, ToolSpec, ToolUseId,
+    Transcript, TurnEnd, TurnId,
 };
 
 use crate::Effect;
@@ -148,6 +149,10 @@ impl SessionState {
         };
         if *schema != SCHEMA_VERSION {
             return Err(RecoveryError::UnsupportedSchema(*schema));
+        }
+        model.validate().map_err(RecoveryError::InvalidPolicy)?;
+        for spec in tools {
+            spec.validate().map_err(RecoveryError::InvalidPolicy)?;
         }
         Ok(Self {
             next: record.offset.next(),
@@ -354,6 +359,11 @@ impl SessionState {
         &self.open
     }
 
+    /// Whether the conversation has already used tool use id `id`.
+    pub(crate) fn has_tool_use(&self, id: &ToolUseId) -> bool {
+        self.transcript.has_tool_use(id)
+    }
+
     pub(crate) fn is_admitted(&self, request_id: &RequestId) -> bool {
         self.admitted.contains(request_id)
     }
@@ -427,6 +437,7 @@ pub enum RecoveryError {
     UnsupportedSchema(u32),
     DuplicateCreation,
     OutOfOrder { expected: Offset, found: Offset },
+    InvalidPolicy(InvalidPolicy),
 }
 
 impl fmt::Display for RecoveryError {
@@ -436,6 +447,7 @@ impl fmt::Display for RecoveryError {
             Self::NotCreated => formatter.write_str("log does not start with SessionCreated"),
             Self::UnsupportedSchema(schema) => write!(formatter, "unsupported log schema {schema}"),
             Self::DuplicateCreation => formatter.write_str("log has a second SessionCreated"),
+            Self::InvalidPolicy(invalid) => write!(formatter, "invalid session policy: {invalid}"),
             Self::OutOfOrder { expected, found } => write!(
                 formatter,
                 "expected a record at offset {}, found offset {}",

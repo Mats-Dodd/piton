@@ -7,7 +7,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use piton_core::{Effect, Input, JournalEntry, RecoveryError, Session, Submission};
-use piton_domain::{EffectId, Offset, Record, SessionId, Timestamp};
+use piton_domain::{EffectId, InvalidPolicy, Json, Offset, Record, SessionId, Timestamp};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -39,6 +39,10 @@ struct Running {
 pub enum OpenError {
     Store(StoreError),
     Recovery(RecoveryError),
+    /// A different session already has this id.
+    AlreadyExists,
+    /// The session's policy cannot be followed.
+    InvalidPolicy(InvalidPolicy),
 }
 
 impl std::fmt::Display for OpenError {
@@ -46,6 +50,8 @@ impl std::fmt::Display for OpenError {
         match self {
             Self::Store(error) => write!(formatter, "could not read the log: {error}"),
             Self::Recovery(error) => write!(formatter, "could not recover the session: {error}"),
+            Self::AlreadyExists => formatter.write_str("a different session already has this id"),
+            Self::InvalidPolicy(invalid) => write!(formatter, "invalid session policy: {invalid}"),
         }
     }
 }
@@ -60,8 +66,12 @@ pub(crate) struct Pump {
     /// Counts the session's lives in this process; bumped by every recovery.
     life: u64,
     events: mpsc::Receiver<Event>,
-    /// Handed to every task the pump starts, so they can report back.
-    sender: mpsc::Sender<Event>,
+    /// Handed to every task the pump starts, so they can report back. Weak,
+    /// so that once every client handle is gone the queue closes and the
+    /// session stops.
+    sender: mpsc::WeakSender<Event>,
+    /// Appends that failed in a row; reset by one that lands.
+    failed_appends: u32,
     effects: BTreeMap<EffectId, Running>,
     append: Option<JoinHandle<()>>,
     durable: watch::Sender<Offset>,
@@ -73,7 +83,7 @@ impl Pump {
         id: SessionId,
         ports: Ports,
         events: mpsc::Receiver<Event>,
-        sender: mpsc::Sender<Event>,
+        sender: &mpsc::Sender<Event>,
     ) -> Result<Self, OpenError> {
         let (session, log_len, entry) = recover(&id, &ports).await?;
         let mut pump = Self {
@@ -82,7 +92,8 @@ impl Pump {
             session,
             life: 0,
             events,
-            sender,
+            sender: sender.downgrade(),
+            failed_appends: 0,
             effects: BTreeMap::new(),
             append: None,
             durable: watch::channel(log_len).0,
@@ -96,7 +107,8 @@ impl Pump {
         self.durable.subscribe()
     }
 
-    /// Runs until the log cannot be read during a recovery.
+    /// Runs until every client handle is dropped, the log cannot be read
+    /// during a recovery, or appends keep failing.
     pub(crate) async fn run(mut self) {
         loop {
             let deadline = self.session.deadline();
@@ -111,10 +123,18 @@ impl Pump {
                         self.effects.remove(&effect);
                     } else {
                         self.append = None;
+                        self.failed_appends = 0;
                     }
                     self.handle(input);
                 }
                 Event::AppendFailed { life } if life == self.life => {
+                    // Storage that keeps failing is not hammered: back off
+                    // between recoveries, and give up after a while.
+                    self.failed_appends = self.failed_appends.saturating_add(1);
+                    if self.failed_appends > MAX_FAILED_APPENDS {
+                        return;
+                    }
+                    tokio::time::sleep(recovery_backoff(self.failed_appends)).await;
                     if self.recover().await.is_err() {
                         return;
                     }
@@ -175,14 +195,19 @@ impl Pump {
                 let id = self.id.clone();
                 let end = end_of(expected, &records);
                 self.append = Some(tokio::spawn(async move {
-                    let event = match store.append(&id, expected, records).await {
-                        Ok(()) => Event::Completed {
+                    // An append that never answers is as ambiguous as one
+                    // that fails.
+                    let appended =
+                        tokio::time::timeout(APPEND_TIMEOUT, store.append(&id, expected, records))
+                            .await;
+                    let event = match appended {
+                        Ok(Ok(())) => Event::Completed {
                             life,
                             input: Input::Appended { end },
                         },
-                        Err(_) => Event::AppendFailed { life },
+                        Ok(Err(_)) | Err(_) => Event::AppendFailed { life },
                     };
-                    sender.send(event).await.unwrap_or_default();
+                    report(&sender, event).await;
                 }));
             }
             Submission::Dispatch { effect } => {
@@ -210,7 +235,7 @@ impl Pump {
         }
     }
 
-    fn spawn_effect(&self, effect: Effect, life: u64, sender: mpsc::Sender<Event>) -> Running {
+    fn spawn_effect(&self, effect: Effect, life: u64, sender: mpsc::WeakSender<Event>) -> Running {
         match effect {
             Effect::CallModel { id, request } => {
                 let model = Arc::clone(&self.ports.model);
@@ -231,10 +256,7 @@ impl Pump {
                             retry_after,
                         },
                     };
-                    sender
-                        .send(Event::Completed { life, input })
-                        .await
-                        .unwrap_or_default();
+                    report(&sender, Event::Completed { life, input }).await;
                 });
                 Running { task, cancel: None }
             }
@@ -242,18 +264,25 @@ impl Pump {
                 let tools = Arc::clone(&self.ports.tools);
                 let (switch, signal) = CancelSignal::new();
                 let task = tokio::spawn(async move {
+                    let asked = signal.clone();
                     let input = match tools.run(id, call, signal).await {
                         ToolCompletion::Returned { output, is_error } => Input::ToolReturned {
                             effect: id,
                             output,
                             is_error,
                         },
-                        ToolCompletion::Stopped => Input::EffectCancelled { effect: id },
+                        ToolCompletion::Stopped if asked.is_cancelled() => {
+                            Input::EffectCancelled { effect: id }
+                        }
+                        // Stopping unasked, as a host shutting down might, is
+                        // the tool failing.
+                        ToolCompletion::Stopped => Input::ToolReturned {
+                            effect: id,
+                            output: Json::string("the tool stopped without being asked to"),
+                            is_error: true,
+                        },
                     };
-                    sender
-                        .send(Event::Completed { life, input })
-                        .await
-                        .unwrap_or_default();
+                    report(&sender, Event::Completed { life, input }).await;
                 });
                 Running {
                     task,
@@ -276,6 +305,27 @@ impl Pump {
 impl Drop for Pump {
     fn drop(&mut self) {
         self.stop_everything();
+    }
+}
+
+/// How long an append may go unanswered before it counts as failed.
+const APPEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many appends may fail in a row before the session gives up.
+const MAX_FAILED_APPENDS: u32 = 8;
+
+/// The wait before recovering after `failures` appends failed in a row:
+/// doubling from 10ms, at most 2s.
+fn recovery_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(8);
+    let millis = 10u64.checked_shl(doublings).unwrap_or(u64::MAX).min(2_000);
+    Duration::from_millis(millis)
+}
+
+/// Hands `event` to the pump, if the session is still running.
+async fn report(sender: &mpsc::WeakSender<Event>, event: Event) {
+    if let Some(sender) = sender.upgrade() {
+        sender.send(event).await.unwrap_or_default();
     }
 }
 

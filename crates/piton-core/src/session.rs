@@ -1,5 +1,6 @@
 use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    format,
     string::{String, ToString as _},
     vec::Vec,
 };
@@ -99,10 +100,24 @@ impl Session {
             }
             Input::ModelResponded { effect, response } => {
                 if self.complete(effect, true) {
-                    let outcome = match response.validate() {
-                        Ok(()) => ModelOutcome::Responded { response },
-                        Err(invalid) => ModelOutcome::Failed {
+                    // A reply that reuses a tool use id from earlier in the
+                    // conversation would make every later request invalid.
+                    let reused = response
+                        .tool_calls()
+                        .into_iter()
+                        .find(|call| self.state.has_tool_use(&call.tool_use_id));
+                    let outcome = match (response.validate(), reused) {
+                        (Ok(()), None) => ModelOutcome::Responded { response },
+                        (Err(invalid), _) => ModelOutcome::Failed {
                             reason: invalid.to_string(),
+                            retryable: false,
+                            retry_after: None,
+                        },
+                        (Ok(()), Some(call)) => ModelOutcome::Failed {
+                            reason: format!(
+                                "response reuses tool use id {}",
+                                call.tool_use_id.as_str()
+                            ),
                             retryable: false,
                             retry_after: None,
                         },
