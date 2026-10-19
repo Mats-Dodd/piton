@@ -26,18 +26,37 @@ pub struct WorldConfig {
     pub submits: u8,
     pub cancels: u8,
     pub crashes: u8,
-    /// Deliver completions for effects the session already abandoned.
-    pub late_completions: bool,
+    /// Deliver what is stale: completions for effects the session already
+    /// abandoned, and acknowledgements again, as storage that delivers at
+    /// least once might.
+    pub stale_deliveries: bool,
     /// Let an append given up on at a crash land afterwards.
     pub late_appends: bool,
+    /// How many times time may pass a deadline before the shell notices,
+    /// so completions race their timers.
+    pub stalls: u8,
 }
 
 impl WorldConfig {
-    /// Small enough for Stateright to explore every state, large enough to
-    /// reach parallel tools, an unknown tool, an invalid reply, a retry, a
-    /// timeout, a cancel, a late append and a crash in one run.
+    /// Crashes and storage: small enough for Stateright to explore every
+    /// state, large enough to reach parallel tools, an unknown tool, an
+    /// invalid reply, a retry, a timeout, a cancel, a late append and a
+    /// crash in one run.
     #[must_use]
-    pub fn exhaustive() -> Self {
+    pub fn crashes() -> Self {
+        Self {
+            crashes: 1,
+            late_appends: true,
+            ..Self::races()
+        }
+        .without_races()
+    }
+
+    /// Races: completions that lose to their timers, stale deliveries and
+    /// cancels, explored exhaustively without crashes, since the product of
+    /// both is too large to explore.
+    #[must_use]
+    pub fn races() -> Self {
         Self {
             tools: tools(),
             model: model_policy(),
@@ -50,9 +69,19 @@ impl WorldConfig {
             model_failures: 1,
             submits: 1,
             cancels: 1,
-            crashes: 1,
-            late_completions: true,
-            late_appends: true,
+            crashes: 0,
+            stale_deliveries: true,
+            late_appends: false,
+            stalls: 2,
+        }
+    }
+
+    #[must_use]
+    fn without_races(self) -> Self {
+        Self {
+            stale_deliveries: false,
+            stalls: 0,
+            ..self
         }
     }
 
@@ -70,8 +99,9 @@ impl WorldConfig {
             submits: 0,
             cancels: 0,
             crashes: 0,
-            late_completions: false,
+            stale_deliveries: false,
             late_appends: false,
+            stalls: 0,
         }
     }
 
@@ -93,8 +123,9 @@ impl WorldConfig {
             submits: 8,
             cancels: 3,
             crashes: 4,
-            late_completions: true,
+            stale_deliveries: true,
             late_appends: true,
+            stalls: 4,
         }
     }
 }
@@ -158,6 +189,9 @@ pub enum EnvAction {
     /// An append the shell gave up on (the `n`th still pending) reaches
     /// storage after all, unseen by the session.
     LateAppendLands(usize),
+    /// Time reaches `until` before the shell notices, as when a process
+    /// stalls: whatever it delivers next arrives after the deadline.
+    Stall { until: Timestamp },
 }
 
 /// An append storage has not answered.
@@ -189,6 +223,13 @@ pub struct Env {
     started: BTreeSet<EffectId>,
     /// Tools that confirmed they stopped.
     stopped: BTreeSet<EffectId>,
+    /// Every completion the shell delivered, by effect, in any life.
+    delivered: BTreeMap<EffectId, Vec<Input>>,
+    /// Tools the session ever asked to stop.
+    cancels_sent: BTreeSet<EffectId>,
+    /// The session's log length when it last dispatched each effect.
+    dispatched_at: BTreeMap<EffectId, Offset>,
+    stalls: u8,
     submits: u8,
     cancels: u8,
     crashes: u8,
@@ -242,6 +283,10 @@ impl World {
             abandoned: BTreeMap::new(),
             started: BTreeSet::new(),
             stopped: BTreeSet::new(),
+            delivered: BTreeMap::new(),
+            cancels_sent: BTreeSet::new(),
+            dispatched_at: BTreeMap::new(),
+            stalls: 0,
             submits: 0,
             cancels: 0,
             crashes: 0,
@@ -313,6 +358,36 @@ impl Env {
         self.stopped.contains(&effect)
     }
 
+    /// The completions the shell delivered for `effect`, in any life.
+    #[must_use]
+    pub fn delivered(&self, effect: EffectId) -> &[Input] {
+        self.delivered.get(&effect).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the session ever asked `effect` to stop.
+    #[must_use]
+    pub fn cancel_sent(&self, effect: EffectId) -> bool {
+        self.cancels_sent.contains(&effect)
+    }
+
+    /// Whether `effect` is running now.
+    #[must_use]
+    pub fn running(&self, effect: EffectId) -> bool {
+        self.dispatched.contains_key(&effect)
+    }
+
+    /// Whether the session has asked running `effect` to stop.
+    #[must_use]
+    pub fn stopping(&self, effect: EffectId) -> bool {
+        self.cancel_requested.contains(&effect)
+    }
+
+    /// The session's log length when it last dispatched `effect`.
+    #[must_use]
+    pub fn dispatched_at(&self, effect: EffectId) -> Option<Offset> {
+        self.dispatched_at.get(&effect).copied()
+    }
+
     /// Whether some tool ever confirmed it stopped.
     #[must_use]
     pub fn any_stopped(&self) -> bool {
@@ -361,7 +436,7 @@ impl Env {
     fn drain(&mut self, session: &mut Session) -> Vec<Submission> {
         let mut submissions = Vec::new();
         while let Some(submission) = session.poll_submission() {
-            if let Err(violation) = self.accept(&submission) {
+            if let Err(violation) = self.accept(&submission, session.log_len()) {
                 self.violation.get_or_insert(violation);
             }
             submissions.push(submission);
@@ -369,7 +444,7 @@ impl Env {
         submissions
     }
 
-    fn accept(&mut self, submission: &Submission) -> Result<(), Violation> {
+    fn accept(&mut self, submission: &Submission, log_len: Offset) -> Result<(), Violation> {
         match submission {
             Submission::Append { expected, records } => {
                 if self.in_flight.is_some() {
@@ -412,6 +487,7 @@ impl Env {
                 if self.dispatched.insert(id, effect.clone()).is_some() {
                     return Err(Violation::DoubleDispatch(id));
                 }
+                self.dispatched_at.insert(id, log_len);
                 if !self.started.insert(id) && safety == Safety::Unsafe {
                     return Err(Violation::UnsafeRedispatch(id));
                 }
@@ -421,6 +497,7 @@ impl Env {
                     return Err(Violation::CancelUndispatched(*effect));
                 }
                 self.cancel_requested.insert(*effect);
+                self.cancels_sent.insert(*effect);
             }
             Submission::Abandon { effect } => {
                 let dropped = self
@@ -433,7 +510,14 @@ impl Env {
         Ok(())
     }
 
-    /// Forgets an effect whose completion the shell is delivering.
+    fn record_delivery(&mut self, effect: EffectId, input: &Input) {
+        self.delivered
+            .entry(effect)
+            .or_default()
+            .push(input.clone());
+    }
+
+    /// Forgets an effect whose completion the shell delivered.
     fn finish(&mut self, effect: EffectId) {
         self.dispatched.remove(&effect);
         self.abandoned.remove(&effect);
@@ -464,12 +548,14 @@ pub fn enabled(config: &WorldConfig, world: &World) -> Vec<EnvAction> {
             Effect::CallModel { .. } => {
                 actions.push(EnvAction::Deliver(respond(*id, done())));
                 if env.model_failures < config.model_failures {
-                    for retryable in [true, false] {
+                    for (retryable, retry_after) in
+                        [(true, None), (true, Some(Millis::new(5))), (false, None)]
+                    {
                         actions.push(EnvAction::Deliver(Input::ModelFailed {
                             effect: *id,
                             reason: "provider error".to_owned(),
                             retryable,
-                            retry_after: None,
+                            retry_after,
                         }));
                     }
                 }
@@ -483,6 +569,9 @@ pub fn enabled(config: &WorldConfig, world: &World) -> Vec<EnvAction> {
                         let mut reply = tool_reply(*id, names);
                         reply.content.extend(reply.content.clone());
                         actions.push(EnvAction::Deliver(respond(*id, reply)));
+                        // Valid the first time; reuses an id from an
+                        // earlier reply after that.
+                        actions.push(EnvAction::Deliver(respond(*id, reused_id_reply())));
                     }
                 }
             }
@@ -492,7 +581,7 @@ pub fn enabled(config: &WorldConfig, world: &World) -> Vec<EnvAction> {
             actions.push(EnvAction::Deliver(Input::EffectCancelled { effect: *id }));
         }
     }
-    if config.late_completions {
+    if config.stale_deliveries {
         for (id, effect) in &env.abandoned {
             actions.push(EnvAction::Deliver(match effect {
                 Effect::CallModel { .. } => respond(*id, done()),
@@ -538,10 +627,43 @@ pub fn enabled(config: &WorldConfig, world: &World) -> Vec<EnvAction> {
             }
         }
     }
+    if config.stale_deliveries {
+        actions.push(EnvAction::Deliver(Input::Appended {
+            end: env.acknowledged,
+        }));
+    }
     if let Some(at) = world.session.deadline() {
         actions.push(EnvAction::Tick { at });
+        if env.stalls < config.stalls && at > env.now {
+            actions.push(EnvAction::Stall { until: at });
+        }
     }
     actions
+}
+
+/// Whether `action` moves the world forward.
+///
+/// The alternative is a fault the environment may or may not inject: crashes
+/// nobody needs, late appends and completions, stalls and duplicate
+/// acknowledgements. Once only those remain, the session must have finished
+/// its work.
+#[must_use]
+pub fn makes_progress(world: &World, action: &EnvAction) -> bool {
+    let env = &world.env;
+    match action {
+        EnvAction::Deliver(Input::Appended { end }) => *end > env.acknowledged,
+        EnvAction::Deliver(
+            Input::ModelResponded { effect, .. }
+            | Input::ModelFailed { effect, .. }
+            | Input::ToolReturned { effect, .. }
+            | Input::EffectCancelled { effect },
+        ) => env.dispatched.contains_key(effect),
+        EnvAction::Deliver(Input::Submit { .. } | Input::CancelTurn { .. } | Input::Tick)
+        | EnvAction::Tick { .. } => true,
+        // A rejected append leaves the shell no choice but to recover.
+        EnvAction::Crash { .. } => env.in_flight.is_some() && !env.append_can_land(),
+        EnvAction::LateAppendLands(_) | EnvAction::Stall { .. } => false,
+    }
 }
 
 /// Whether a shell could do `action` now, whatever its payload. This is the
@@ -561,7 +683,8 @@ pub fn admits(world: &World, action: &EnvAction) -> bool {
     match action {
         EnvAction::Deliver(input) => match input {
             Input::Appended { end } => {
-                env.append_can_land() && env.in_flight.as_ref().map(end_of) == Some(*end)
+                (env.append_can_land() && env.in_flight.as_ref().map(end_of) == Some(*end))
+                    || *end <= env.acknowledged
             }
             Input::ModelResponded { effect, .. } | Input::ModelFailed { effect, .. } => {
                 is_model(effect)
@@ -571,6 +694,7 @@ pub fn admits(world: &World, action: &EnvAction) -> bool {
             Input::Submit { .. } | Input::CancelTurn { .. } | Input::Tick => true,
         },
         EnvAction::Tick { .. }
+        | EnvAction::Stall { .. }
         | EnvAction::Crash {
             append_lands: false,
         } => true,
@@ -590,26 +714,28 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
     let input = match action {
         EnvAction::Deliver(input) => {
             match &input {
-                Input::Appended { .. } => {
-                    if let Some(pending) = env.in_flight.take() {
+                Input::Appended { end } => {
+                    let lands =
+                        env.append_can_land() && env.in_flight.as_ref().map(end_of) == Some(*end);
+                    if lands && let Some(pending) = env.in_flight.take() {
                         env.land(pending.records);
+                        env.acknowledged = env.tail();
                     }
-                    env.acknowledged = env.tail();
                 }
                 Input::ModelResponded { effect, response } => {
-                    env.finish(*effect);
                     if !response.tool_calls().is_empty() {
                         env.tool_rounds = env.tool_rounds.saturating_add(1);
                     }
+                    env.record_delivery(*effect, &input);
                 }
                 Input::ModelFailed { effect, .. } => {
-                    env.finish(*effect);
                     env.model_failures = env.model_failures.saturating_add(1);
+                    env.record_delivery(*effect, &input);
                 }
-                Input::ToolReturned { effect, .. } => env.finish(*effect),
+                Input::ToolReturned { effect, .. } => env.record_delivery(*effect, &input),
                 Input::EffectCancelled { effect } => {
-                    env.finish(*effect);
                     env.stopped.insert(*effect);
+                    env.record_delivery(*effect, &input);
                 }
                 Input::Submit { request_id, .. } => {
                     if *request_id == self::request_id(env.submits) {
@@ -619,7 +745,19 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
                 Input::CancelTurn { .. } => env.cancels = env.cancels.saturating_add(1),
                 Input::Tick => {}
             }
-            input
+            // The effect's task has finished, but the session may still
+            // abandon it in this same step if its time ran out first; only
+            // forget it once the session has had its say.
+            world.session.handle(env.now, input.clone());
+            let submissions = env.drain(&mut world.session);
+            if let Some(effect) = completed_effect(&input) {
+                env.finish(effect);
+            }
+            return Some(JournalEntry::Handled {
+                now: env.now,
+                input,
+                submissions,
+            });
         }
         EnvAction::Tick { at } => {
             env.now = env.now.max(at);
@@ -639,6 +777,7 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
             env.dispatched.clear();
             env.cancel_requested.clear();
             env.abandoned.clear();
+            env.dispatched_at.clear();
             env.acknowledged = env.tail();
             match Session::from_log(env.now, &env.durable) {
                 Ok(session) => world.session = session,
@@ -653,6 +792,11 @@ pub fn step(world: &mut World, action: EnvAction) -> Option<JournalEntry> {
                 log_len: env.acknowledged,
                 submissions,
             });
+        }
+        EnvAction::Stall { until } => {
+            env.now = env.now.max(until);
+            env.stalls = env.stalls.saturating_add(1);
+            return None;
         }
         EnvAction::LateAppendLands(index) => {
             if index < env.late.len() {
@@ -754,6 +898,31 @@ fn tool_ok(effect: EffectId) -> Input {
         effect,
         output: Json::string("ok"),
         is_error: false,
+    }
+}
+
+/// The effect a completion input answers, if it answers one.
+const fn completed_effect(input: &Input) -> Option<EffectId> {
+    match input {
+        Input::ModelResponded { effect, .. }
+        | Input::ModelFailed { effect, .. }
+        | Input::ToolReturned { effect, .. }
+        | Input::EffectCancelled { effect } => Some(*effect),
+        Input::Appended { .. } | Input::Submit { .. } | Input::CancelTurn { .. } | Input::Tick => {
+            None
+        }
+    }
+}
+
+/// A reply asking for `search` under a fixed tool use id, which a later
+/// reply reuses.
+fn reused_id_reply() -> ModelResponse {
+    ModelResponse {
+        content: Vec::from([ContentBlock::ToolUse {
+            id: ToolUseId::new("use-reused".to_owned()),
+            name: search(),
+            input: Json::string("input"),
+        }]),
     }
 }
 

@@ -15,7 +15,7 @@ use stateright::{Checker as _, HasDiscoveries, Model as _};
 
 #[test]
 fn stateright_finds_the_planted_bug() {
-    let checker = Checked(WorldConfig::exhaustive())
+    let checker = Checked(WorldConfig::crashes())
         .checker()
         .finish_when(HasDiscoveries::AnyFailures)
         .spawn_bfs()
@@ -26,7 +26,7 @@ fn stateright_finds_the_planted_bug() {
     // Stateright 0.31 lets later discoveries overwrite earlier ones, so the
     // path is a counterexample but not necessarily a shortest one. Replay it
     // to find the first step that breaks.
-    let mut world = World::new(&WorldConfig::exhaustive(), Timestamp::EPOCH);
+    let mut world = World::new(&WorldConfig::crashes(), Timestamp::EPOCH);
     let first_break = counterexample
         .into_actions()
         .into_iter()

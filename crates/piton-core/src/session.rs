@@ -83,22 +83,17 @@ impl Session {
     /// first, so the outcome never depends on whether the shell noticed the
     /// time or the input first. `now` never moves the session's clock
     /// backwards.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the shell acknowledges an append that is not outstanding.
     pub fn handle(&mut self, now: Timestamp, input: Input) {
         self.now = self.now.max(now);
         self.produce_due();
         match input {
+            // An acknowledgement for anything but the outstanding append is a
+            // duplicate from storage that delivers at least once; ignore it.
             Input::Appended { end } => {
-                assert_eq!(
-                    self.in_flight,
-                    Some(end),
-                    "an acknowledgement must match the outstanding append"
-                );
-                self.durable = end;
-                self.in_flight = None;
+                if self.in_flight == Some(end) {
+                    self.durable = end;
+                    self.in_flight = None;
+                }
             }
             Input::ModelResponded { effect, response } => {
                 if self.complete(effect, true) {
@@ -186,6 +181,12 @@ impl Session {
             }
         }
         earliest
+    }
+
+    /// The session's clock: the latest time it has been given.
+    #[must_use]
+    pub const fn now(&self) -> Timestamp {
+        self.now
     }
 
     #[must_use]
@@ -335,9 +336,15 @@ impl Session {
                     outcome,
                 })
             }
+            // A tool that may have started is never claimed to have
+            // stopped: an idempotent one is dropped at once, an unsafe one
+            // once it has had its grace period to confirm; either way, what
+            // it did is unknown.
             Kind::Tool { safety, .. } => match (safety, started, reason) {
                 (_, false, Some(reason)) => tool(ToolOutcome::NotRun { reason }),
-                (Safety::Idempotent, true, Some(reason)) => tool(ToolOutcome::Stopped { reason }),
+                (Safety::Idempotent, true, Some(_)) => tool(ToolOutcome::Unknown {
+                    cause: UnknownCause::Abandoned,
+                }),
                 (Safety::Unsafe, true, Some(_)) if passed(timers.hard) => {
                     tool(ToolOutcome::Unknown {
                         cause: UnknownCause::Abandoned,

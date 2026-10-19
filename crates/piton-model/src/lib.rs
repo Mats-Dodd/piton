@@ -26,6 +26,6 @@ pub use check::{Violation, check, check_exploration};
 pub use checker::Checked;
 pub use journal::{Divergence, DivergenceReason, from_ndjson, to_ndjson, validate, walk};
 pub use world::{
-    Env, EnvAction, World, WorldConfig, admits, enabled, model_policy, recoveries, search,
-    send_email, step, tools,
+    Env, EnvAction, World, WorldConfig, admits, enabled, makes_progress, model_policy, recoveries,
+    search, send_email, step, tools,
 };

@@ -34,6 +34,20 @@ stateright = { version = "=0.31.0", default-features = false }
 debug-assertions = true
 overflow-checks = true
 
+# The model checker runs the core millions of times; optimise what it runs
+# even in test builds. Assertions and overflow checks stay on.
+[profile.dev.package.piton-core]
+opt-level = 3
+
+[profile.dev.package.piton-domain]
+opt-level = 3
+
+[profile.dev.package.piton-model]
+opt-level = 3
+
+[profile.dev.package.stateright]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
 overflow-checks = true

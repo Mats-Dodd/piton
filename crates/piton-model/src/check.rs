@@ -3,13 +3,13 @@ use std::{
     fmt,
 };
 
-use piton_core::SessionState;
+use piton_core::{Input, SessionState};
 use piton_domain::{
-    EffectId, Millis, ModelOutcome, ModelPolicy, Offset, Record, RecordBody, Safety, StopReason,
-    Timestamp, ToolName, ToolOutcome, ToolSpec, TurnId, UnknownCause,
+    EffectId, Millis, ModelOutcome, ModelPolicy, Offset, Record, RecordBody, RequestId, Safety,
+    StopReason, Timestamp, ToolName, ToolOutcome, ToolSpec, TurnId, UnknownCause,
 };
 
-use crate::{World, WorldConfig, admits, enabled};
+use crate::{World, WorldConfig, admits, enabled, makes_progress};
 
 /// A broken invariant.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -21,6 +21,8 @@ pub enum Violation {
     DispatchMismatch(EffectId),
     DoubleDispatch(EffectId),
     UnsafeRedispatch(EffectId),
+    /// An effect of a cancelled turn was dispatched after the cancellation.
+    DispatchAfterCancel(EffectId),
     CancelUndispatched(EffectId),
     AbandonUndispatched(EffectId),
     ConcurrentAppend,
@@ -34,16 +36,46 @@ pub enum Violation {
         effect: EffectId,
         reason: String,
     },
+    /// A request was admitted more than once.
+    AdmittedTwice(RequestId),
+    /// A turn started for a request that was not admitted, or that already
+    /// had a turn.
+    TurnWithoutInput(TurnId),
+    /// A recorded outcome is not what the environment delivered, or claims
+    /// a cause that did not happen.
+    UnfaithfulOutcome(EffectId),
     /// A tool reported as not run had been dispatched.
     UntruthfulNotRun(EffectId),
-    /// An unsafe tool reported as stopped never confirmed it.
+    /// A tool reported as stopped never confirmed it.
     UnconfirmedStop(EffectId),
+    /// A stop or skip is put down to a cancellation that did not happen.
+    WrongStopReason(EffectId),
+    /// An unsafe tool was abandoned without first being asked to stop.
+    MissingCancel(EffectId),
     /// A timeout or grace period was cut short.
     PrematureTimeout(EffectId),
     /// A model call was retried before its backoff passed.
     PrematureRetry(EffectId),
+    /// A model call was retried after a failure that ended its attempts.
+    RetryAfterFatalFailure(EffectId),
     /// A turn made more model calls in a row than its retry policy allows.
     TooManyAttempts(TurnId),
+    /// An effect's time ran out but the session has not resolved it.
+    Overdue(EffectId),
+    /// A result was used although it arrived after the effect's time ran
+    /// out; timers due by an input's time fire before the input.
+    LateResult(EffectId),
+    /// An effect the session resolved without it is still running: the
+    /// session never told the shell to drop it.
+    ResolvedButRunning(EffectId),
+    /// The session asks to be woken later than its next timer.
+    LateDeadline,
+    /// A turn's backoff ended but the session has not retried.
+    RetryOverdue(TurnId),
+    /// A turn ran out of attempts but has not ended.
+    TurnNotEnded(TurnId),
+    /// No turn is running, yet an admitted request waits.
+    IdleWithQueue,
     /// The session's deadline is not in its future.
     StaleDeadline,
     /// The generator explores something the contract forbids.
@@ -62,10 +94,34 @@ impl std::error::Error for Violation {}
 
 /// What the checks need to know about an effect's intent.
 struct Intent {
+    offset: Offset,
     at: Timestamp,
     turn: TurnId,
-    /// `None` for model calls.
+    /// `None` for model calls; the spec is `None` for unknown tools.
     tool: Option<(Safety, Option<ToolSpec>)>,
+}
+
+/// What the checks track about a turn.
+#[derive(Default)]
+struct TurnFacts {
+    cancelled: Option<(Offset, Timestamp)>,
+    ended: bool,
+    /// Consecutive failed model calls, and when the last allows a retry.
+    failures: u32,
+    retry_at: Option<Timestamp>,
+    /// The last failure was not retryable, or used the last attempt.
+    finished_failing: bool,
+}
+
+/// Everything learned from one scan of a log.
+#[derive(Default)]
+struct Scan {
+    intents: BTreeMap<EffectId, Intent>,
+    resolved: BTreeSet<EffectId>,
+    turns: BTreeMap<TurnId, TurnFacts>,
+    admitted: BTreeSet<RequestId>,
+    started: BTreeSet<RequestId>,
+    resumed: Vec<Offset>,
 }
 
 /// Checks the safety invariants: they hold in every state of every run,
@@ -92,79 +148,22 @@ pub fn check(world: &World) -> Result<(), Violation> {
     SessionState::fold(env.durable())
         .map_err(|error| Violation::Unrecoverable(error.to_string()))?;
 
-    let (tools, model) = match produced.first().map(|record| &record.body) {
-        Some(RecordBody::SessionCreated { tools, model, .. }) => (
-            tools
-                .iter()
-                .map(|spec| (spec.name.clone(), spec.clone()))
-                .collect::<BTreeMap<ToolName, ToolSpec>>(),
-            *model,
-        ),
-        _ => return Err(Violation::ReplayDiverged),
-    };
+    // The log the session knows and the log storage holds both tell the
+    // truth; they differ only while an append is outstanding or after one
+    // from an earlier life landed late.
+    let known = scan(world, &produced)?;
+    let stored: Vec<&Record> = env.durable().iter().collect();
+    scan(world, &stored)?;
 
-    let mut intents: BTreeMap<EffectId, Intent> = BTreeMap::new();
-    let mut resolved = BTreeSet::new();
-    let mut cancelled: BTreeMap<TurnId, Timestamp> = BTreeMap::new();
-    // Per turn: consecutive failures, and when the last one allows a retry.
-    let mut failures: BTreeMap<TurnId, (u32, Timestamp)> = BTreeMap::new();
-    for record in &produced {
-        let id = EffectId::new(record.offset);
-        match &record.body {
-            RecordBody::ModelIntent { turn, request } => {
-                request
-                    .validate()
-                    .map_err(|reason| Violation::MalformedModelRequest {
-                        effect: id,
-                        reason: reason.to_string(),
-                    })?;
-                if let Some((_, retry_at)) = failures.get(turn)
-                    && record.at < *retry_at
-                {
-                    return Err(Violation::PrematureRetry(id));
-                }
-                intents.insert(
-                    id,
-                    Intent {
-                        at: record.at,
-                        turn: *turn,
-                        tool: None,
-                    },
-                );
-            }
-            RecordBody::ToolIntent { turn, call, safety } => {
-                intents.insert(
-                    id,
-                    Intent {
-                        at: record.at,
-                        turn: *turn,
-                        tool: Some((*safety, tools.get(&call.name).cloned())),
-                    },
-                );
-            }
-            RecordBody::ModelResolved { effect, outcome } => {
-                let intent = resolve(&intents, &mut resolved, *effect, true)?;
-                check_model_outcome(&model, intent, record, &mut failures, outcome)?;
-            }
-            RecordBody::ToolResolved { effect, outcome } => {
-                let intent = resolve(&intents, &mut resolved, *effect, false)?;
-                check_tool_outcome(world, &cancelled, *effect, intent, record.at, outcome)?;
-            }
-            RecordBody::TurnCancelled { turn } => {
-                cancelled.entry(*turn).or_insert(record.at);
-            }
-            RecordBody::SessionCreated { .. }
-            | RecordBody::SessionResumed
-            | RecordBody::InputAdmitted { .. }
-            | RecordBody::TurnStarted { .. }
-            | RecordBody::TurnEnded { .. } => {}
-        }
+    check_dispatches(world, &known)?;
+    check_nothing_overdue(world, &known, &produced)?;
+    if let Some(effect) = known.resolved.iter().find(|effect| env.running(**effect)) {
+        return Err(Violation::ResolvedButRunning(*effect));
     }
 
-    // A deadline already passed would leave the shell ticking for nothing.
     if session
         .deadline()
-        .is_some_and(|deadline| deadline <= env.now())
+        .is_some_and(|deadline| deadline <= session.now())
     {
         return Err(Violation::StaleDeadline);
     }
@@ -172,8 +171,8 @@ pub fn check(world: &World) -> Result<(), Violation> {
 }
 
 /// Checks that only make sense while exploring with a generator: it stays
-/// within the contract, and once it can do nothing more, the session has
-/// finished everything it started.
+/// within the contract, and once nothing but optional faults can happen,
+/// the session has finished everything it started.
 ///
 /// # Errors
 ///
@@ -183,29 +182,121 @@ pub fn check_exploration(config: &WorldConfig, world: &World) -> Result<(), Viol
     if !actions.iter().all(|action| admits(world, action)) {
         return Err(Violation::GeneratorExceedsContract);
     }
-    let session = world.session();
-    let mut open = BTreeSet::new();
-    for record in world.env().known().chain(session.unsubmitted()) {
-        if let RecordBody::ModelResolved { effect, .. } | RecordBody::ToolResolved { effect, .. } =
-            &record.body
-        {
-            open.remove(effect);
-        } else if let RecordBody::ModelIntent { .. } | RecordBody::ToolIntent { .. } = &record.body
-        {
-            open.insert(EffectId::new(record.offset));
-        }
+    if actions.iter().any(|action| makes_progress(world, action)) {
+        return Ok(());
     }
-    let unresolved = !open.is_empty();
-    if actions.is_empty()
-        && (session.active_turn().is_some()
-            || world.env().in_flight()
-            || !session.unsubmitted().is_empty()
-            || session.deadline().is_some()
-            || unresolved)
+    let session = world.session();
+    let produced: Vec<&Record> = world.env().known().chain(session.unsubmitted()).collect();
+    let known = scan(world, &produced)?;
+    let unresolved = known
+        .intents
+        .keys()
+        .any(|effect| !known.resolved.contains(effect));
+    if session.active_turn().is_some()
+        || world.env().in_flight()
+        || !session.unsubmitted().is_empty()
+        || session.deadline().is_some()
+        || unresolved
+        || known.admitted != known.started
     {
         return Err(Violation::StuckAtQuiescence);
     }
     Ok(())
+}
+
+/// Walks a log, checking every rule that holds record by record.
+fn scan(world: &World, records: &[&Record]) -> Result<Scan, Violation> {
+    let Some(RecordBody::SessionCreated { tools, model, .. }) =
+        records.first().map(|record| &record.body)
+    else {
+        return Err(Violation::ReplayDiverged);
+    };
+    let tools: BTreeMap<ToolName, ToolSpec> = tools
+        .iter()
+        .map(|spec| (spec.name.clone(), spec.clone()))
+        .collect();
+    let mut scan = Scan::default();
+    for record in records {
+        let id = EffectId::new(record.offset);
+        match &record.body {
+            RecordBody::InputAdmitted { request_id, .. } => {
+                if !scan.admitted.insert(request_id.clone()) {
+                    return Err(Violation::AdmittedTwice(request_id.clone()));
+                }
+            }
+            RecordBody::TurnStarted { request_id } => {
+                let turn = TurnId::new(record.offset);
+                if !scan.admitted.contains(request_id) || !scan.started.insert(request_id.clone()) {
+                    return Err(Violation::TurnWithoutInput(turn));
+                }
+                scan.turns.insert(turn, TurnFacts::default());
+            }
+            RecordBody::ModelIntent { turn, request } => {
+                request
+                    .validate()
+                    .map_err(|reason| Violation::MalformedModelRequest {
+                        effect: id,
+                        reason: reason.to_string(),
+                    })?;
+                let facts = scan.turns.entry(*turn).or_default();
+                if facts.finished_failing {
+                    return Err(Violation::RetryAfterFatalFailure(id));
+                }
+                if facts.retry_at.is_some_and(|retry_at| record.at < retry_at) {
+                    return Err(Violation::PrematureRetry(id));
+                }
+                facts.retry_at = None;
+                scan.intents.insert(
+                    id,
+                    Intent {
+                        offset: record.offset,
+                        at: record.at,
+                        turn: *turn,
+                        tool: None,
+                    },
+                );
+            }
+            RecordBody::ToolIntent { turn, call, safety } => {
+                scan.intents.insert(
+                    id,
+                    Intent {
+                        offset: record.offset,
+                        at: record.at,
+                        turn: *turn,
+                        tool: Some((*safety, tools.get(&call.name).cloned())),
+                    },
+                );
+            }
+            RecordBody::ModelResolved { effect, outcome } => {
+                let intent = resolve(&scan.intents, &mut scan.resolved, *effect, true)?;
+                let facts = scan.turns.entry(intent.turn).or_default();
+                check_model_outcome(world, model, intent, facts, record, *effect, outcome)?;
+            }
+            RecordBody::ToolResolved { effect, outcome } => {
+                let intent = resolve(&scan.intents, &mut scan.resolved, *effect, false)?;
+                let context = ToolContext {
+                    effect: *effect,
+                    at: record.at,
+                    cancelled: scan
+                        .turns
+                        .get(&intent.turn)
+                        .and_then(|facts| facts.cancelled),
+                    restarted: scan.resumed.iter().any(|resumed| intent.offset < *resumed),
+                };
+                check_tool_outcome(world, intent, &context, outcome)?;
+            }
+            RecordBody::TurnCancelled { turn } => {
+                let facts = scan.turns.entry(*turn).or_default();
+                facts.cancelled.get_or_insert((record.offset, record.at));
+            }
+            RecordBody::TurnEnded { turn, .. } => {
+                scan.turns.entry(*turn).or_default().ended = true;
+            }
+            RecordBody::SessionResumed => scan.resumed.push(record.offset),
+            RecordBody::SessionCreated { .. } => {}
+        }
+    }
+    Ok(scan)
 }
 
 /// Marks `effect` resolved, returning its intent.
@@ -225,91 +316,305 @@ fn resolve<'intent>(
     Ok(intent)
 }
 
-/// Retries stay within the policy and wait out their backoff.
+/// A model outcome is what the provider delivered, or a timeout or
+/// cancellation that really happened; retries stay within the policy.
 fn check_model_outcome(
+    world: &World,
     model: &ModelPolicy,
     intent: &Intent,
+    facts: &mut TurnFacts,
     record: &Record,
-    failures: &mut BTreeMap<TurnId, (u32, Timestamp)>,
+    effect: EffectId,
     outcome: &ModelOutcome,
 ) -> Result<(), Violation> {
+    let delivered = world.env().delivered(effect);
     match outcome {
-        ModelOutcome::Failed { retry_after, .. } => {
-            let count = failures
-                .get(&intent.turn)
-                .map_or(0, |(count, _)| *count)
-                .saturating_add(1);
-            if count > model.retry.max_attempts {
+        ModelOutcome::Responded { response } => {
+            let faithful = delivered.iter().any(|input| {
+                matches!(input, Input::ModelResponded { response: given, .. } if given == response)
+            });
+            if !faithful {
+                return Err(Violation::UnfaithfulOutcome(effect));
+            }
+            if facts.cancelled.is_some() || record.at >= intent.at.after(model.timeout) {
+                return Err(Violation::LateResult(effect));
+            }
+            facts.failures = 0;
+        }
+        ModelOutcome::Failed {
+            reason,
+            retryable,
+            retry_after,
+        } => {
+            let reported = delivered.iter().any(|input| {
+                matches!(input, Input::ModelFailed { reason: given, retryable: given_retryable, retry_after: given_after, .. }
+                    if given == reason && given_retryable == retryable && given_after == retry_after)
+            });
+            // A reply the session judged unusable fails for good.
+            let rejected_reply = !retryable
+                && retry_after.is_none()
+                && delivered
+                    .iter()
+                    .any(|input| matches!(input, Input::ModelResponded { .. }));
+            if reported || rejected_reply {
+                if facts.cancelled.is_some() || record.at >= intent.at.after(model.timeout) {
+                    return Err(Violation::LateResult(effect));
+                }
+            } else {
+                // Otherwise it can only be the session's own timeout.
+                if !retryable || retry_after.is_some() {
+                    return Err(Violation::UnfaithfulOutcome(effect));
+                }
+                if record.at < intent.at.after(model.timeout) {
+                    return Err(Violation::PrematureTimeout(effect));
+                }
+            }
+            facts.failures = facts.failures.saturating_add(1);
+            if facts.failures > model.retry.max_attempts {
                 return Err(Violation::TooManyAttempts(intent.turn));
             }
             let wait = model
                 .retry
-                .backoff(count)
+                .backoff(facts.failures)
                 .max(retry_after.unwrap_or(Millis::ZERO));
-            failures.insert(intent.turn, (count, record.at.after(wait)));
+            facts.retry_at = Some(record.at.after(wait));
+            facts.finished_failing = !retryable || facts.failures >= model.retry.max_attempts;
         }
-        ModelOutcome::Responded { .. } => {
-            failures.remove(&intent.turn);
+        ModelOutcome::Cancelled => {
+            if facts
+                .cancelled
+                .is_none_or(|(_, cancelled_at)| cancelled_at > record.at)
+            {
+                return Err(Violation::UnfaithfulOutcome(effect));
+            }
         }
-        ModelOutcome::Cancelled => {}
     }
     Ok(())
 }
 
-/// Tool outcomes tell the truth, and time-driven ones come no earlier than
-/// their deadlines.
+/// Where a tool outcome sits in its log.
+struct ToolContext {
+    effect: EffectId,
+    at: Timestamp,
+    /// The turn's cancellation, if it came before.
+    cancelled: Option<(Offset, Timestamp)>,
+    /// Whether the session restarted after the intent.
+    restarted: bool,
+}
+
+/// Tool outcomes are what the tool delivered or what really happened to it,
+/// and time-driven ones come no earlier than their deadlines.
 fn check_tool_outcome(
     world: &World,
-    cancelled: &BTreeMap<TurnId, Timestamp>,
-    effect: EffectId,
     intent: &Intent,
-    at: Timestamp,
+    context: &ToolContext,
     outcome: &ToolOutcome,
 ) -> Result<(), Violation> {
     let Some((safety, spec)) = &intent.tool else {
         return Ok(());
     };
-    let timeout = spec.as_ref().map(|spec| intent.at.after(spec.timeout));
-    let premature = |due: Option<Timestamp>| due.is_some_and(|due| at < due);
+    let effect = context.effect;
+    let env = world.env();
+    let Some(spec) = spec else {
+        return if *outcome == ToolOutcome::UnknownTool {
+            Ok(())
+        } else {
+            Err(Violation::UnfaithfulOutcome(effect))
+        };
+    };
+    let timeout = intent.at.after(spec.timeout);
+    let premature = |due: Timestamp| context.at < due;
+    // A result counts only if it arrived before the session gave up on the
+    // tool: an idempotent one at its timeout or cancellation, an unsafe one
+    // once its grace period after either ran out.
+    let late = match safety {
+        Safety::Idempotent => context.cancelled.is_some() || context.at >= timeout,
+        Safety::Unsafe => {
+            let grace = spec.cancel_grace;
+            let after_cancel = context
+                .cancelled
+                .map(|(_, cancelled_at)| cancelled_at.after(grace));
+            let hard =
+                after_cancel.map_or(timeout.after(grace), |due| due.min(timeout.after(grace)));
+            context.at >= hard
+        }
+    };
+    let check_reason = |reason: &StopReason| match reason {
+        StopReason::TurnCancelled if context.cancelled.is_none() => {
+            Err(Violation::WrongStopReason(effect))
+        }
+        StopReason::TimedOut if premature(timeout) => Err(Violation::PrematureTimeout(effect)),
+        StopReason::TurnCancelled | StopReason::TimedOut => Ok(()),
+    };
     match outcome {
-        ToolOutcome::NotRun { reason } => {
-            if world.env().started(effect) {
-                return Err(Violation::UntruthfulNotRun(effect));
+        ToolOutcome::Returned { output, is_error } => {
+            let faithful = env.delivered(effect).iter().any(|input| {
+                matches!(input, Input::ToolReturned { output: given, is_error: given_error, .. }
+                    if given == output && given_error == is_error)
+            });
+            if !faithful {
+                return Err(Violation::UnfaithfulOutcome(effect));
             }
-            if *reason == StopReason::TimedOut && premature(timeout) {
-                return Err(Violation::PrematureTimeout(effect));
+            if late {
+                return Err(Violation::LateResult(effect));
             }
         }
+        ToolOutcome::NotRun { reason } => {
+            if env.started(effect) {
+                return Err(Violation::UntruthfulNotRun(effect));
+            }
+            check_reason(reason)?;
+        }
         ToolOutcome::Stopped { reason } => {
-            if *safety == Safety::Unsafe && !world.env().stopped(effect) {
+            if !env.stopped(effect) {
                 return Err(Violation::UnconfirmedStop(effect));
             }
-            if *reason == StopReason::TimedOut && premature(timeout) {
-                return Err(Violation::PrematureTimeout(effect));
+            if late {
+                return Err(Violation::LateResult(effect));
+            }
+            check_reason(reason)?;
+        }
+        ToolOutcome::Unknown {
+            cause: UnknownCause::Restart,
+        } => {
+            if *safety != Safety::Unsafe || !context.restarted {
+                return Err(Violation::UnfaithfulOutcome(effect));
             }
         }
         ToolOutcome::Unknown {
             cause: UnknownCause::Abandoned,
         } => {
-            let grace = spec.as_ref().map(|spec| spec.cancel_grace);
-            let after_timeout = timeout.zip(grace).map(|(due, grace)| due.after(grace));
-            let after_cancel = cancelled
-                .get(&intent.turn)
-                .zip(grace)
-                .map(|(due, grace)| due.after(grace));
-            let earliest = match (after_timeout, after_cancel) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                (left, right) => left.or(right),
+            let grace = spec.cancel_grace;
+            let after_cancel = context
+                .cancelled
+                .map(|(_, cancelled_at)| cancelled_at.after(grace));
+            let earliest = match *safety {
+                Safety::Unsafe => {
+                    let after_timeout = timeout.after(grace);
+                    after_cancel.map_or(after_timeout, |due| due.min(after_timeout))
+                }
+                Safety::Idempotent => after_cancel.map_or(timeout, |due| due.min(timeout)),
             };
             if premature(earliest) {
                 return Err(Violation::PrematureTimeout(effect));
             }
+            if *safety == Safety::Unsafe && grace > Millis::ZERO && !env.cancel_sent(effect) {
+                return Err(Violation::MissingCancel(effect));
+            }
         }
-        ToolOutcome::Returned { .. }
-        | ToolOutcome::Unknown {
-            cause: UnknownCause::Restart,
+        ToolOutcome::UnknownTool => return Err(Violation::UnfaithfulOutcome(effect)),
+    }
+    Ok(())
+}
+
+/// Nothing of a cancelled turn is dispatched once the cancellation is
+/// recorded.
+fn check_dispatches(world: &World, scan: &Scan) -> Result<(), Violation> {
+    for (effect, intent) in &scan.intents {
+        let cancelled = scan
+            .turns
+            .get(&intent.turn)
+            .and_then(|facts| facts.cancelled);
+        if let (Some((cancelled_at, _)), Some(dispatched_at)) =
+            (cancelled, world.env().dispatched_at(*effect))
+            && dispatched_at > cancelled_at
+        {
+            return Err(Violation::DispatchAfterCancel(*effect));
         }
-        | ToolOutcome::UnknownTool => {}
+    }
+    Ok(())
+}
+
+/// By the session's own clock, nothing it should already have done is
+/// left undone.
+fn check_nothing_overdue(
+    world: &World,
+    scan: &Scan,
+    produced: &[&Record],
+) -> Result<(), Violation> {
+    let session = world.session();
+    let now = session.now();
+    let env = world.env();
+    let Some(RecordBody::SessionCreated { model, .. }) =
+        produced.first().map(|record| &record.body)
+    else {
+        return Err(Violation::ReplayDiverged);
+    };
+    // The earliest moment the session has something to do without input.
+    let mut next: Option<Timestamp> = None;
+    let mut wake_by = |at: Timestamp| next = Some(next.map_or(at, |next| next.min(at)));
+    for (effect, intent) in &scan.intents {
+        if scan.resolved.contains(effect) {
+            continue;
+        }
+        let cancelled = scan
+            .turns
+            .get(&intent.turn)
+            .and_then(|facts| facts.cancelled)
+            .map(|(_, cancelled_at)| cancelled_at);
+        let due = match &intent.tool {
+            None => cancelled.unwrap_or_else(|| intent.at.after(model.timeout)),
+            Some((_, None)) => intent.at,
+            Some((Safety::Idempotent, Some(spec))) => {
+                let timeout = intent.at.after(spec.timeout);
+                cancelled.map_or(timeout, |at| at.min(timeout))
+            }
+            Some((Safety::Unsafe, Some(spec))) => {
+                let stop = intent.at.after(spec.timeout);
+                let ask = cancelled.map_or(stop, |at| at.min(stop));
+                if spec.cancel_grace > Millis::ZERO
+                    && now >= ask
+                    && env.running(*effect)
+                    && !env.stopping(*effect)
+                {
+                    return Err(Violation::MissingCancel(*effect));
+                }
+                if !env.stopping(*effect) {
+                    wake_by(ask);
+                }
+                ask.after(spec.cancel_grace)
+            }
+        };
+        if now >= due {
+            return Err(Violation::Overdue(*effect));
+        }
+        wake_by(due);
+    }
+    let mut active = false;
+    for (turn, facts) in &scan.turns {
+        if facts.ended {
+            continue;
+        }
+        active = true;
+        let awaiting_model = scan.intents.iter().any(|(effect, intent)| {
+            intent.turn == *turn && intent.tool.is_none() && !scan.resolved.contains(effect)
+        });
+        if awaiting_model || facts.cancelled.is_some() {
+            continue;
+        }
+        if facts.finished_failing {
+            return Err(Violation::TurnNotEnded(*turn));
+        }
+        if let Some(retry_at) = facts.retry_at {
+            // Jitter adds at most a quarter of the backoff.
+            let jitter = model
+                .retry
+                .backoff(facts.failures)
+                .get()
+                .checked_shr(2)
+                .unwrap_or(0);
+            let latest = retry_at.after(Millis::new(jitter));
+            if now >= latest {
+                return Err(Violation::RetryOverdue(*turn));
+            }
+            wake_by(latest);
+        }
+    }
+    if next.is_some_and(|next| session.deadline().is_none_or(|deadline| deadline > next)) {
+        return Err(Violation::LateDeadline);
+    }
+    if !active && scan.admitted.len() > scan.started.len() {
+        return Err(Violation::IdleWithQueue);
     }
     Ok(())
 }

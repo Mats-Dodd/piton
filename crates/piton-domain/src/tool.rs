@@ -10,7 +10,7 @@ use crate::{Json, Millis, ToolName, ToolUseId};
 pub enum Safety {
     /// Harmless to repeat or abandon, or deduplicated on the effect id:
     /// recovery dispatches it again under the same id, and cancellation simply
-    /// drops it.
+    /// drops it, recording its outcome as unknown if it may have started.
     Idempotent,
     /// Must not run twice: recovery reports it as possibly run, and
     /// cancellation asks it to stop, waiting up to its grace period for an
@@ -51,7 +51,9 @@ pub enum StopReason {
 pub enum UnknownCause {
     /// The session restarted while the tool may have been running.
     Restart,
-    /// The tool did not confirm it stopped within its grace period.
+    /// The session stopped waiting for the tool: an idempotent tool when it
+    /// was cancelled or timed out, an unsafe one when it did not confirm it
+    /// stopped within its grace period.
     Abandoned,
 }
 
@@ -95,7 +97,7 @@ impl ToolOutcome {
             } => "interrupted by a restart: it may or may not have run, in whole or in part",
             Self::Unknown {
                 cause: UnknownCause::Abandoned,
-            } => "did not confirm it stopped: it may or may not have run, in whole or in part",
+            } => "abandoned before it finished: it may or may not have run, in whole or in part",
             Self::UnknownTool => "no tool with this name exists",
         };
         (Json::string(text), true)
