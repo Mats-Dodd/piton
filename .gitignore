@@ -13,3 +13,6 @@ devenv.local.yaml
 
 # Local secrets
 .env
+
+# Claude Code agent worktrees
+.claude/worktrees/
