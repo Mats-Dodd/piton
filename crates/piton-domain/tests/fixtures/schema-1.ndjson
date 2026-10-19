@@ -1,0 +1,16 @@
+{"offset":0,"at":1700000000000,"body":{"kind":"session_created","schema":1,"tools":[{"name":"search","replay":"redispatch"}]}}
+{"offset":1,"at":1700000000000,"body":{"kind":"input_admitted","request_id":"request-1","text":"find piton"}}
+{"offset":2,"at":1700000000000,"body":{"kind":"turn_started","request_id":"request-1"}}
+{"offset":3,"at":1700000000000,"body":{"kind":"model_intent","turn":2,"request":{"messages":[{"role":"user","content":[{"type":"text","text":"find piton"}]}]}}}
+{"offset":4,"at":1700000000000,"body":{"kind":"model_resolved","effect":3,"outcome":{"status":"responded","response":{"content":[{"type":"tool_use","id":"use-1","name":"search","input":{"limit":3,"query":"piton"}}]}}}}
+{"offset":5,"at":1700000000000,"body":{"kind":"tool_intent","turn":2,"call":{"tool_use_id":"use-1","name":"search","input":{"limit":3,"query":"piton"}},"replay":"interrupt"}}
+{"offset":6,"at":1700000000000,"body":{"kind":"tool_resolved","effect":5,"outcome":{"status":"returned","output":"found","is_error":false}}}
+{"offset":7,"at":1700000000000,"body":{"kind":"tool_resolved","effect":5,"outcome":{"status":"cancelled"}}}
+{"offset":8,"at":1700000000000,"body":{"kind":"tool_resolved","effect":5,"outcome":{"status":"interrupted"}}}
+{"offset":9,"at":1700000000000,"body":{"kind":"tool_resolved","effect":5,"outcome":{"status":"unknown_tool"}}}
+{"offset":10,"at":1700000000000,"body":{"kind":"model_resolved","effect":3,"outcome":{"status":"failed","reason":"overloaded"}}}
+{"offset":11,"at":1700000000000,"body":{"kind":"model_resolved","effect":3,"outcome":{"status":"cancelled"}}}
+{"offset":12,"at":1700000000000,"body":{"kind":"turn_cancelled","turn":2}}
+{"offset":13,"at":1700000000000,"body":{"kind":"turn_ended","turn":2,"reason":"completed"}}
+{"offset":14,"at":1700000000000,"body":{"kind":"turn_ended","turn":2,"reason":"failed"}}
+{"offset":15,"at":1700000000000,"body":{"kind":"turn_ended","turn":2,"reason":"cancelled"}}

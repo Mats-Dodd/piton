@@ -11,6 +11,15 @@ repository = "https://github.com/Mats-Dodd/piton"
 [workspace.dependencies]
 # Every external dependency is declared once here with default features off;
 # crates opt into exactly the features they use.
+piton-core = { path = "crates/piton-core", version = "0.1.0" }
+piton-domain = { path = "crates/piton-domain", version = "0.1.0" }
+
+proptest = { version = "1.12.0", default-features = false }
+serde = { version = "1.0.229", default-features = false }
+serde_json = { version = "1.0.154", default-features = false }
+# Pinned exactly: thinly maintained, and model-checking results should not
+# shift under a dependency bump. Its own dependencies are not feature-gated.
+stateright = { version = "=0.31.0", default-features = false }
 
 [profile.dev]
 debug-assertions = true
@@ -48,6 +57,9 @@ unused_import_braces = "warn"
 unused_lifetimes = "warn"
 unused_macro_rules = "warn"
 unused_qualifications = "warn"
+# `piton_planted_bug` deliberately breaks the core so `just planted-bug` can
+# prove the checkers catch it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(piton_planted_bug)"] }
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

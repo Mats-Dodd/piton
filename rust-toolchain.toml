@@ -2,3 +2,5 @@
 channel = "1.99.0"
 profile = "minimal"
 components = ["clippy", "rustfmt", "rust-src"]
+# The core must run in a Durable Object; `just core-wasm` keeps it honest.
+targets = ["wasm32-unknown-unknown"]

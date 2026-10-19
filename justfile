@@ -19,10 +19,18 @@ test:
 test-ci:
     cargo nextest run --workspace --all-features --profile ci --no-tests pass
 
-# Add to `ci` once the workspace has a library crate: `cargo test --doc` fails
-# on a workspace of binaries alone.
 doctest:
     cargo test --workspace --doc
+
+# The domain and core run anywhere, including wasm hosts such as Durable
+# Objects; checking against a target without std proves they need no OS.
+core-wasm:
+    cargo check -p piton-domain -p piton-core --target wasm32-unknown-unknown
+
+# Rebuilds the core with a deliberate bug and proves the checkers catch it.
+# A separate target dir keeps the normal build cache intact.
+planted-bug:
+    RUSTFLAGS="--cfg piton_planted_bug" CARGO_TARGET_DIR=target/planted-bug cargo nextest run -p piton-model --profile ci
 
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
@@ -35,4 +43,4 @@ unused-deps:
 
 supply-chain: deny unused-deps
 
-ci: check test-ci docs supply-chain
+ci: check test-ci doctest core-wasm planted-bug docs supply-chain

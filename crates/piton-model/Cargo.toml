@@ -1,0 +1,21 @@
+[package]
+name = "piton-model"
+description = "Verification harness: drives the real piton core through a modelled environment."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+piton-core.workspace = true
+piton-domain.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+stateright.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
